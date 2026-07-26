@@ -30,8 +30,9 @@ var IsForwarding func(alias string) bool
 
 // ServerItem implements list.Item interface for displaying server list items.
 type ServerItem struct {
-	Server     domain.Server
-	PingStatus *bool // nil=unknown, true=up, false=down
+	Server        domain.Server
+	PingStatus    *bool // nil=unknown, true=up, false=down
+	SessionActive bool  // true when a live PTY session exists for this server
 }
 
 func (i ServerItem) Title() string {
@@ -82,6 +83,9 @@ func (d ServerDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 	}
 
 	statusDot := renderPingDot(serverItem.PingStatus)
+	if serverItem.SessionActive {
+		statusDot = "🟢"
+	}
 
 	var pinStr string
 	if !s.PinnedAt.IsZero() {
@@ -90,8 +94,9 @@ func (d ServerDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 		pinStr = " "
 	}
 
-	// prefix: "● ★ " = 4 display cols
-	prefixCols := 4
+	// prefixCols = dot_width(1 or 2) + space + pin(1) + space = 3 or 4
+	dotCols := runewidth.StringWidth(statusDot)
+	prefixCols := dotCols + 3
 	aliasWidth := available - prefixCols
 	if aliasWidth < 4 {
 		aliasWidth = 4
@@ -99,10 +104,15 @@ func (d ServerDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 
 	alias := truncatePad(s.Alias, aliasWidth)
 
-	line := fmt.Sprintf("%s %s %s", statusDot, pinStr, alias)
+	line := statusDot + " " + pinStr + " " + alias
 
 	if isSelected {
-		line = ListSelectedItemStyle.Width(available).Render(line)
+		// Re-measure the line width so the highlight fills exactly `available` cols.
+		lineW := runewidth.StringWidth(line)
+		if pad := available - lineW; pad > 0 {
+			line += strings.Repeat(" ", pad)
+		}
+		line = ListSelectedItemStyle.Render(line)
 	} else {
 		line = ListItemStyle.Render(line)
 	}

@@ -58,15 +58,13 @@ var ListBorderStyle = lipgloss.NewStyle().
 
 // ListItemStyle is the default (unselected) list row.
 var ListItemStyle = lipgloss.NewStyle().
-	Foreground(colorText).
-	Padding(0, 1)
+	Foreground(colorText)
 
 // ListSelectedItemStyle highlights the currently focused list row.
 var ListSelectedItemStyle = lipgloss.NewStyle().
 	Bold(true).
 	Foreground(colorText).
-	Background(colorSelected).
-	Padding(0, 1)
+	Background(colorSelected)
 
 // DetailsBorderStyle wraps the server detail pane with a rounded border.
 // Uses Padding(0, 2) — horizontal padding only — so vertical overhead matches

@@ -42,6 +42,7 @@ const (
 	StateFormPreview
 	StateFileBrowser
 	StateSSHAuthInput
+	StateSessionView // embedded PTY tab sessions
 )
 
 type AppModel struct {
@@ -68,6 +69,9 @@ type AppModel struct {
 	sshAuthInput  textinput.Model
 	sshAuthAlias  string
 	sshAuthServer domain.Server
+	sessions           SessionsModel
+	activeSessionAlias string // alias shown in the right-panel overlay ("" = show details)
+	terminalFocused    bool   // true = keys forwarded to PTY; false = left panel navigable
 }
 
 // Message types
@@ -188,13 +192,25 @@ func (m *AppModel) selectedServer() *domain.Server {
 	return &m.servers[idx]
 }
 
-// updateDetailsForSelected loads the raw SSH config block for the currently
-// selected server and feeds it to the details panel with syntax highlighting.
+// updateDetailsForSelected loads config for the selected server and auto-switches
+// the right panel to show a session overlay when that server has an active session.
 func (m *AppModel) updateDetailsForSelected() {
 	s := m.selectedServer()
 	if s == nil {
 		m.details.SetRawConfig("")
+		if !m.terminalFocused {
+			m.activeSessionAlias = ""
+		}
 		return
+	}
+	// When left panel has focus, auto-show session overlay for servers that
+	// have an active session, or fall back to config details.
+	if !m.terminalFocused {
+		if m.sessions.findByAlias(s.Alias) != nil {
+			m.activeSessionAlias = s.Alias
+		} else {
+			m.activeSessionAlias = ""
+		}
 	}
 	raw, err := m.serverService.GetRawConfigBlock(s.Alias)
 	if err != nil || raw == "" {
@@ -208,10 +224,13 @@ func (m *AppModel) updateDetailsForSelected() {
 func (m *AppModel) updateListItems() {
 	items := make([]list.Item, len(m.servers))
 	for i, s := range m.servers {
-		items[i] = ServerItem{Server: s, PingStatus: m.pingStatus[s.Alias]}
+		items[i] = ServerItem{
+			Server:        s,
+			PingStatus:    m.pingStatus[s.Alias],
+			SessionActive: m.sessions.findByAlias(s.Alias) != nil,
+		}
 	}
 	m.list.SetItems(items)
-	// Update details panel
 	m.updateDetailsForSelected()
 }
 
@@ -223,6 +242,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.sessions.width = msg.Width
+		m.sessions.height = msg.Height
+		m.sessions.resizeAll()
 
 	case ServersLoadedMsg:
 		m.servers = []domain.Server(msg)
@@ -306,6 +328,26 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.statusBar, cmd = m.statusBar.Show("SSH auth failed for "+msg.Alias+": "+msg.Err.Error(), "#C62828")
 		return m, cmd
+
+	case PtyOutputMsg:
+		// PTY has new output — re-render happens automatically; re-queue reader.
+		if tab := m.sessions.findByAlias(msg.Alias); tab != nil {
+			m.updateListItems() // refresh 🟢 indicators
+			return m, waitForPtyOutput(tab)
+		}
+
+	case SessionClosedMsg:
+		m.sessions.removeByAlias(msg.Alias)
+		if m.activeSessionAlias == msg.Alias {
+			m.activeSessionAlias = ""
+		}
+		m.updateListItems()
+		var cmd tea.Cmd
+		m.statusBar, cmd = m.statusBar.Show("Session closed: "+msg.Alias, "#e0af68")
+		if len(m.sessions.tabs) == 0 {
+			m.state = StateList
+		}
+		cmds = append(cmds, cmd)
 	}
 
 	switch m.state {
@@ -370,6 +412,9 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var inputCmd tea.Cmd
 		m.sshAuthInput, inputCmd = m.sshAuthInput.Update(msg)
 		return m, tea.Batch(append(cmds, inputCmd)...)
+
+	case StateSessionView:
+		return m.updateStateSession(msg, cmds)
 	}
 
 	return m, tea.Batch(cmds...)
@@ -380,6 +425,50 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
+		key := msg.String()
+
+		// Terminal overlay is focused → forward keys to PTY except escape combos.
+		if m.terminalFocused && m.activeSessionAlias != "" && !m.searching {
+			switch key {
+			case "esc":
+				// Blur terminal → refocus left panel (session stays alive).
+				m.terminalFocused = false
+				return m, tea.Batch(cmds...)
+			case "ctrl+n":
+				m.sessions.nextTab()
+				if tab := m.sessions.activeTab(); tab != nil {
+					m.activeSessionAlias = tab.server.Alias
+				}
+				return m, tea.Batch(cmds...)
+			case "ctrl+p":
+				m.sessions.prevTab()
+				if tab := m.sessions.activeTab(); tab != nil {
+					m.activeSessionAlias = tab.server.Alias
+				}
+				return m, tea.Batch(cmds...)
+			default:
+				if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.closed {
+					if data := keyToBytes(key); data != nil {
+						tab.writeInput(data)
+					}
+				}
+				return m, tea.Batch(cmds...)
+			}
+		}
+
+		// Left panel is focused (overlay may be visible but not focused).
+		// Ctrl+D closes the session for the currently selected server.
+		if key == "ctrl+d" && !m.searching {
+			if s := m.selectedServer(); s != nil {
+				m.sessions.removeByAlias(s.Alias)
+				if m.activeSessionAlias == s.Alias {
+					m.activeSessionAlias = ""
+					m.terminalFocused = false
+				}
+				m.updateListItems()
+			}
+			return m, tea.Batch(cmds...)
+		}
 		// If searching, handle search input first
 		if m.searching {
 			switch msg.String() {
@@ -543,6 +632,29 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statusBar, cmd = m.statusBar.Show(sortModeName(m.sortMode), "")
 			cmds = append(cmds, cmd)
 
+		case "right":
+			// Open or focus an embedded PTY session for the selected server.
+			if s := m.selectedServer(); s != nil {
+				// If session already exists, focus its overlay.
+				if existing := m.sessions.findByAlias(s.Alias); existing != nil {
+					m.activeSessionAlias = s.Alias
+					m.terminalFocused = true
+					return m, tea.Batch(cmds...)
+				}
+				tab, err := newSession(*s, m.sessions.termCols(), m.sessions.termRows())
+				if err != nil {
+					var statusCmd tea.Cmd
+					m.statusBar, statusCmd = m.statusBar.Show("Session failed: "+err.Error(), "#f7768e")
+					cmds = append(cmds, statusCmd)
+				} else {
+					m.sessions.addSession(tab)
+					m.activeSessionAlias = s.Alias
+					m.terminalFocused = true
+					m.updateListItems()
+					return m, tea.Batch(append(cmds, waitForPtyOutput(tab))...)
+				}
+			}
+
 		case "enter":
 			if s := m.selectedServer(); s != nil {
 				alias := s.Alias
@@ -588,6 +700,57 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	m.list, cmd = m.list.Update(msg)
 	cmds = append(cmds, cmd)
 	m.updateDetailsForSelected()
+	return m, tea.Batch(cmds...)
+}
+
+func (m AppModel) updateStateSession(msg tea.Msg, cmds []tea.Cmd) (tea.Model, tea.Cmd) {
+	kp, ok := msg.(tea.KeyPressMsg)
+	if !ok {
+		return m, tea.Batch(cmds...)
+	}
+
+	key := kp.String()
+
+	// Ctrl+A is our prefix key (like tmux's Ctrl+B).
+	// We track it via a simple flag embedded as a prefix in the key string.
+	// bubbletea reports it as "ctrl+a".
+	switch key {
+	case "ctrl+a":
+		// Next key will be interpreted as a session command; handled via a
+		// lightweight convention: store a flag and wait for the next event.
+		// For simplicity, use dedicated shortcuts directly.
+		return m, tea.Batch(cmds...)
+
+	// Session-management shortcuts (no prefix required to keep it simple).
+	case "ctrl+\\": // return to list view, sessions stay alive
+		m.state = StateList
+		return m, tea.Batch(cmds...)
+
+	case "ctrl+n": // next tab
+		m.sessions.nextTab()
+		return m, tea.Batch(cmds...)
+
+	case "ctrl+p": // prev tab
+		m.sessions.prevTab()
+		return m, tea.Batch(cmds...)
+
+	case "ctrl+w": // close active tab
+		if tab := m.sessions.activeTab(); tab != nil {
+			alias := tab.server.Alias
+			m.sessions.removeByAlias(alias)
+			if len(m.sessions.tabs) == 0 {
+				m.state = StateList
+			}
+		}
+		return m, tea.Batch(cmds...)
+	}
+
+	// Forward all other keys to the active PTY.
+	if tab := m.sessions.activeTab(); tab != nil && !tab.closed {
+		if data := keyToBytes(key); data != nil {
+			tab.writeInput(data)
+		}
+	}
 	return m, tea.Batch(cmds...)
 }
 
@@ -667,6 +830,11 @@ func (m AppModel) View() tea.View {
 			v.AltScreen = true
 			return v
 
+		case StateSessionView:
+			v := tea.NewView(m.renderSessionView())
+			v.AltScreen = true
+			return v
+
 		case StateSSHAuthInput:
 			bg := m.viewBackground()
 			overlay := m.viewSSHAuthInput()
@@ -675,7 +843,23 @@ func (m AppModel) View() tea.View {
 		default:
 			// Normal list view
 			c := m.viewContent()
-			statusBar := m.statusBar.View(m.width)
+			var statusBar string
+			if m.activeSessionAlias != "" {
+				focusHint := "→:enter   Esc:back to list"
+				if m.terminalFocused {
+					focusHint = "Esc:back to list   ^D:close"
+				}
+				sessionInfo := lipgloss.NewStyle().
+					Foreground(colorDim).
+					Render("  " + m.activeSessionAlias + "   " + focusHint)
+				if bar := m.statusBar.View(m.width); bar != "" {
+					statusBar = bar
+				} else {
+					statusBar = sessionInfo
+				}
+			} else {
+				statusBar = m.statusBar.View(m.width)
+			}
 			content = lipgloss.JoinVertical(lipgloss.Left, c, statusBar)
 		}
 	}
@@ -789,9 +973,10 @@ func (m AppModel) viewContent() string {
 		bodyH = 3
 	}
 
-	leftW := (w * 30) / 100
-	if leftW < 15 {
-		leftW = 15
+	// Left panel = 1/4, right panel = 3/4 of terminal width.
+	leftW := w / 4
+	if leftW < 18 {
+		leftW = 18
 	}
 	rightW := w - leftW
 
@@ -828,12 +1013,20 @@ func (m AppModel) viewContent() string {
 	} else {
 		leftContent = m.list.View()
 	}
-	// Use fixed-height border
-	leftPane := ListBorderStyle.Width(innerW).Height(bodyH).Render(leftContent)
+	// Width(leftW): lipgloss v2 Width sets outer total, so pass leftW not innerW.
+	leftPane := ListBorderStyle.Width(leftW).Height(bodyH).Render(leftContent)
 
-	// Right panel: details.SetSize with exact dimensions
-	m.details.SetSize(rightW, bodyH)
-	rightPane := m.details.View().Content
+	// Right panel: terminal overlay if a session is active, else config details
+	var rightPane string
+	if m.activeSessionAlias != "" {
+		if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil {
+			rightPane = renderTerminalOverlay(tab, rightW, bodyH, m.terminalFocused)
+		}
+	}
+	if rightPane == "" {
+		m.details.SetSize(rightW, bodyH)
+		rightPane = m.details.View().Content
+	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Top, leftPane, rightPane)
 }

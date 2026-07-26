@@ -1,0 +1,38 @@
+# https://taskfile.dev
+
+version: "3"
+silent: true
+
+tasks:
+  default:
+    cmds:
+      - ./lazyssh
+    interactive: true
+    desc: Build and run
+    deps:
+      - build
+
+  build:
+    cmds:
+      - go build -ldflags "-X github.com/linpr/lazyssh/cmd.version=$(git describe --tags --always --dirty) -X github.com/linpr/lazyssh/cmd.commit=$(git rev-parse --short HEAD)" -o lazyssh ./cmd/
+    desc: Build binary
+
+  lint:
+    desc: Run linters
+    cmds:
+      - golangci-lint run --path-mode=abs --timeout=5m
+
+  fmt:
+    desc: Run go fmt
+    cmds:
+      - go fmt ./...
+
+  test:
+    desc: Run tests
+    cmds:
+      - go test ./...
+
+  clean:
+    desc: Remove built binary
+    cmds:
+      - rm -f lazyssh lazyssh-*

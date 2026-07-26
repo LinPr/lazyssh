@@ -37,10 +37,10 @@ func NewDetailsModel() DetailsModel {
 }
 
 // innerW returns the usable text width inside the border+padding.
-// -7 instead of -6: the extra -1 ensures the right closing border char (╯/╮)
-// is never pushed off the terminal's last column when the panel fills full width.
+// DetailsBorderStyle manual rendering: border(1+1) + padding(2+2) = 6 overhead.
+// innerW = m.width - 6 so total box = innerW + 6 = m.width, filling rightW exactly.
 func (m *DetailsModel) innerW() int {
-	w := m.width - 7
+	w := m.width - 6
 	if w < 10 {
 		w = 10
 	}
