@@ -25,6 +25,7 @@ concurrency:
 
 env:
   # Pure-Go static binaries: no libc dependency, runs on any distro.
+  # Keep this off any job that also runs `go test -race`, which needs cgo.
   CGO_ENABLED: "0"
   # Strip local build paths so the binaries are reproducible.
   GOFLAGS: "-trimpath"

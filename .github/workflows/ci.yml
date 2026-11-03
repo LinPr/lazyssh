@@ -11,8 +11,10 @@ on:
 permissions:
   contents: read
 
+# NOTE: CGO_ENABLED is deliberately NOT set globally. -race requires cgo, and a
+# job-level CGO_ENABLED=0 makes `go test -race` fail with "requires cgo" before
+# any test runs. The build job sets it per-step instead.
 env:
-  CGO_ENABLED: "0"
   GOFLAGS: "-trimpath"
 
 jobs:
@@ -96,6 +98,8 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           EXT: ${{ matrix.ext }}
+          # Static binaries: no libc dependency.
+          CGO_ENABLED: "0"
         run: |
           set -euo pipefail
           out="lazyssh-${GOOS}-${GOARCH}${EXT}"
