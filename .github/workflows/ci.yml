@@ -44,7 +44,22 @@ jobs:
       # The tests drive pty/tmux-style code paths; -race is the point of this
       # job, since the session reader and the render loop share an emulator.
       - name: Test (race detector)
-        run: go test -race ./...
+        run: |
+          set -o pipefail
+          # -v makes the output useful in the step summary when this fails.
+          go test -race -v ./... 2>&1 | tee /tmp/test.log
+
+      - name: Test failure summary
+        # The raw job log needs admin rights to download, so surface the failure
+        # in the step summary, which the API exposes to anyone with read access.
+        if: failure()
+        run: |
+          {
+            echo '## Test output (tail)'
+            echo '```'
+            tail -n 200 /tmp/test.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}

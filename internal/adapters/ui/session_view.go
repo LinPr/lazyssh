@@ -59,7 +59,7 @@ func (m SessionsModel) renderTabStrip(width int) string {
 	var parts []string
 	for i, t := range m.tabs {
 		dot := "●"
-		if t.closed {
+		if t.isClosed() {
 			dot = "○"
 		}
 		label := fmt.Sprintf(" %s %d:%s ", dot, i+1, t.server.Alias)
@@ -87,7 +87,7 @@ func (m SessionsModel) renderTerminal(w, h int) string {
 	if tab == nil {
 		return renderEmptyTerminal(w, h)
 	}
-	if tab.closed {
+	if tab.isClosed() {
 		return renderClosedTerminal(w, h, tab.server.Alias)
 	}
 	return tab.renderGrid(w, h)

@@ -47,8 +47,9 @@ type SessionTab struct {
 	outCh  chan struct{}
 	closed bool
 
-	// mu guards term: the reader goroutine writes to it while the render loop
-	// reads cells out of it. *vt.Emulator is not internally synchronised.
+	// mu guards term and the lifecycle fields below: the reader goroutine writes
+	// to them while the UI goroutine reads them. *vt.Emulator is not internally
+	// synchronised, and `closed` is set on the reader goroutine.
 	mu sync.Mutex
 
 	// scrollOffset counts lines scrolled back from the live view: 0 is the
@@ -119,7 +120,9 @@ func (t *SessionTab) responseLoop() {
 // signals outCh on every non-empty read. Closes outCh on EOF.
 func (t *SessionTab) readLoop() {
 	defer func() {
+		t.mu.Lock()
 		t.closed = true
+		t.mu.Unlock()
 		close(t.outCh)
 	}()
 
@@ -147,6 +150,13 @@ func (t *SessionTab) readLoop() {
 			return
 		}
 	}
+}
+
+// isClosed reports whether the session process has exited.
+func (t *SessionTab) isClosed() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.closed
 }
 
 // writeInput forwards keyboard bytes to the PTY (and thus to the ssh process).

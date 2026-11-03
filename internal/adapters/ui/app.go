@@ -440,7 +440,7 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case sessionTickMsg:
-		if tab := m.sessions.findByAlias(msg.Alias); tab != nil && !tab.closed {
+		if tab := m.sessions.findByAlias(msg.Alias); tab != nil && !tab.isClosed() {
 			return m, sessionRedraw(msg.Alias)
 		}
 
@@ -554,7 +554,7 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Paste while the embedded terminal is focused must go to the PTY, not to the
 	// search box.
 	if paste, ok := msg.(tea.PasteMsg); ok && m.terminalFocused && !m.searching {
-		if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.closed {
+		if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.isClosed() {
 			tab.paste(paste.Content)
 			return m, tea.Batch(cmds...)
 		}
@@ -584,15 +584,15 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, tea.Batch(cmds...)
 			case "ctrl+v", "ctrl+shift+v":
-				if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.closed && !tab.altScreen() {
+				if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.isClosed() && !tab.altScreen() {
 					return m.pasteIntoSession(tab)
 				}
-				if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.closed {
+				if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.isClosed() {
 					tab.writeInput([]byte{0x16}) // vim/less keep their own Ctrl+V
 				}
 				return m, tea.Batch(cmds...)
 			default:
-				if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.closed {
+				if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.isClosed() {
 					if data := keyToBytes(key); data != nil {
 						tab.writeInput(data)
 					}
@@ -933,7 +933,7 @@ func (m AppModel) updateStateSession(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Terminal paste (Ctrl+Shift+V / middle click in most emulators) arrives as a
 	// PasteMsg, not as key presses, so it needs its own branch.
 	if paste, ok := msg.(tea.PasteMsg); ok {
-		if tab := m.sessions.activeTab(); tab != nil && !tab.closed {
+		if tab := m.sessions.activeTab(); tab != nil && !tab.isClosed() {
 			tab.paste(paste.Content)
 		}
 		return m, nil
@@ -949,13 +949,13 @@ func (m AppModel) updateStateSession(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch key := kp.String(); key {
 	case "pgup":
-		if tab != nil && !tab.closed {
+		if tab != nil && !tab.isClosed() {
 			tab.scrollBy(bodyRows(m.height))
 		}
 		return m, nil
 
 	case "pgdown":
-		if tab != nil && !tab.closed {
+		if tab != nil && !tab.isClosed() {
 			tab.scrollBy(-bodyRows(m.height))
 		}
 		return m, nil
@@ -986,7 +986,7 @@ func (m AppModel) updateStateSession(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// shortcut, so map the usual keys to a clipboard paste as well.
 		// Inside a full-screen program (vim, less) Ctrl+V is a real binding
 		// (visual block), so only intercept it at an ordinary prompt.
-		if tab != nil && !tab.closed && !tab.altScreen() {
+		if tab != nil && !tab.isClosed() && !tab.altScreen() {
 			return m.pasteIntoSession(tab)
 		}
 		return m, nil
@@ -1010,7 +1010,7 @@ func (m AppModel) updateStateSession(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	if tab := m.sessions.activeTab(); tab != nil && !tab.closed {
+	if tab := m.sessions.activeTab(); tab != nil && !tab.isClosed() {
 		// Typing always returns to the live view, like every terminal does.
 		if tab.isScrolledBack() {
 			tab.scrollToBottom()
@@ -1028,7 +1028,7 @@ func (m AppModel) handleSessionMouse(msg tea.Msg) (bool, tea.Cmd) {
 	switch ev := msg.(type) {
 	case tea.MouseWheelMsg:
 		tab := m.sessions.activeTab()
-		if tab == nil || tab.closed {
+		if tab == nil || tab.isClosed() {
 			return false, nil
 		}
 		// In the alternate screen the wheel belongs to the remote program
@@ -1050,7 +1050,7 @@ func (m AppModel) handleSessionMouse(msg tea.Msg) (bool, tea.Cmd) {
 			return false, nil
 		}
 		tab := m.sessions.activeTab()
-		if tab == nil || tab.closed {
+		if tab == nil || tab.isClosed() {
 			return false, nil
 		}
 		text, err := clipboard.ReadAll()
@@ -1669,7 +1669,7 @@ func (m AppModel) handleEmbeddedTerminalMouse(msg tea.Msg) (bool, tea.Cmd) {
 		return false, nil
 	}
 	tab := m.sessions.findByAlias(m.activeSessionAlias)
-	if tab == nil || tab.closed {
+	if tab == nil || tab.isClosed() {
 		return false, nil
 	}
 
