@@ -83,6 +83,10 @@ func (s StatusBar) View(width int) string {
 		return msgStyle.Render(s.msg)
 	}
 
-	// No active message — hide the status bar.
-	return ""
+	// No active message: keep the row occupied with the key-hint line so the
+	// frame height stays constant (an empty string would shorten the layout by
+	// one row and make the UI jump whenever a message expired).
+	return base.
+		Foreground(colorDim).
+		Render(DefaultStatusText)
 }

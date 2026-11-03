@@ -19,53 +19,59 @@ import (
 	"strings"
 	"time"
 
-	"github.com/linpr/lazyssh/internal/core/domain"
 	"github.com/kevinburke/ssh_config"
+	"github.com/linpr/lazyssh/internal/core/domain"
 )
 
 // toDomainServer converts ssh_config.Config to a slice of domain.Server.
 func (r *Repository) toDomainServer(cfg *ssh_config.Config) []domain.Server {
 	servers := make([]domain.Server, 0, len(cfg.Hosts))
 	for _, host := range cfg.Hosts {
-
-		aliases := make([]string, 0, len(host.Patterns))
-
-		for _, pattern := range host.Patterns {
-			alias := pattern.String()
-			// Skip if alias contains wildcards (not a concrete Host)
-			if strings.ContainsAny(alias, "!*?[]") {
-				continue
-			}
-			aliases = append(aliases, alias)
+		if srv, ok := r.hostToServer(host); ok {
+			servers = append(servers, srv)
 		}
-		if len(aliases) == 0 {
+	}
+	return servers
+}
+
+// hostToServer converts a single Host block, returning false when the block has
+// no concrete alias (wildcard-only or negated patterns).
+func (r *Repository) hostToServer(host *ssh_config.Host) (domain.Server, bool) {
+	aliases := make([]string, 0, len(host.Patterns))
+	for _, pattern := range host.Patterns {
+		alias := pattern.String()
+		// Skip if alias contains wildcards (not a concrete Host)
+		if strings.ContainsAny(alias, "!*?[]") {
 			continue
 		}
-		server := domain.Server{
-			Alias:         aliases[0],
-			Aliases:       aliases,
-			Port:          22,
-			IdentityFiles: []string{},
-		}
-
-		for _, node := range host.Nodes {
-			kvNode, ok := node.(*ssh_config.KV)
-			if !ok {
-				continue
-			}
-
-			r.mapKVToServer(&server, kvNode)
-		}
-
-		servers = append(servers, server)
+		aliases = append(aliases, alias)
+	}
+	if len(aliases) == 0 {
+		return domain.Server{}, false
+	}
+	server := domain.Server{
+		Alias:         aliases[0],
+		Aliases:       aliases,
+		Port:          22,
+		IdentityFiles: []string{},
 	}
 
-	return servers
+	for _, node := range host.Nodes {
+		kvNode, ok := node.(*ssh_config.KV)
+		if !ok {
+			continue
+		}
+		r.mapKVToServer(&server, kvNode)
+	}
+
+	return server, true
 }
 
 // mapKVToServer maps an ssh_config.KV node to the corresponding fields in domain.Server.
 func (r *Repository) mapKVToServer(server *domain.Server, kvNode *ssh_config.KV) {
-	key := strings.ToLower(kvNode.Key)
+	// Upstream ssh_config (≥1.5) carries indentation in the key for nodes that
+	// were built programmatically, so trim before comparing.
+	key := strings.ToLower(strings.TrimSpace(kvNode.Key))
 	value := kvNode.Value
 
 	// Try mapping in order of categories

@@ -16,10 +16,12 @@ package services
 
 import (
 	"bufio"
+	"crypto/sha256"
 	"fmt"
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -38,16 +40,49 @@ type serverService struct {
 	logger           *zap.SugaredLogger
 
 	fwMu     sync.Mutex
-	forwards map[string][]*os.Process
+	forwards map[string]*forwardProc
+
+	// pingCache memoises recent TCP probes so a refresh with 100 hosts does not
+	// open 100 sockets every time the list reloads.
+	pingMu    sync.Mutex
+	pingCache map[string]pingResult
+
+	// pingSem bounds how many probes run at once.
+	pingSem chan struct{}
+
+	// configPath is the ssh config file this service operates on.
+	configPath string
 }
 
+// pingResult is one cached reachability probe.
+type pingResult struct {
+	up      bool
+	latency time.Duration
+	err     error
+	at      time.Time
+}
+
+const (
+	pingCacheTTL      = 20 * time.Second
+	pingConcurrency   = 8
+	sshDialTimeout    = 3 * time.Second
+	controlPersistSec = "600"
+)
+
 // NewServerService creates a new instance of serverService.
-func NewServerService(logger *zap.SugaredLogger, sr ports.ServerRepository) ports.ServerService {
+func NewServerService(logger *zap.SugaredLogger, sr ports.ServerRepository, configPath string) ports.ServerService {
 	return &serverService{
 		logger:           logger,
 		serverRepository: sr,
+		forwards:         make(map[string]*forwardProc),
+		pingCache:        make(map[string]pingResult),
+		pingSem:          make(chan struct{}, pingConcurrency),
+		configPath:       configPath,
 	}
 }
+
+// ConfigPath returns the ssh config file the service operates on.
+func (s *serverService) ConfigPath() string { return s.configPath }
 
 // ListServers returns a list of servers sorted with pinned on top.
 func (s *serverService) ListServers(query string) ([]domain.Server, error) {
@@ -73,12 +108,15 @@ func (s *serverService) ListServers(query string) ([]domain.Server, error) {
 	return servers, nil
 }
 
+var aliasPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
+var hostPattern = regexp.MustCompile(`^[A-Za-z0-9.-]+$`)
+
 // validateServer performs core validation of server fields.
 func validateServer(srv domain.Server) error {
 	if strings.TrimSpace(srv.Alias) == "" {
 		return fmt.Errorf("alias is required")
 	}
-	if ok, _ := regexp.MatchString(`^[A-Za-z0-9_.-]+$`, srv.Alias); !ok {
+	if !aliasPattern.MatchString(srv.Alias) {
 		return fmt.Errorf("alias may contain letters, digits, dot, dash, underscore")
 	}
 	if strings.TrimSpace(srv.Host) == "" {
@@ -88,7 +126,7 @@ func validateServer(srv domain.Server) error {
 		if strings.Contains(srv.Host, " ") {
 			return fmt.Errorf("host must not contain spaces")
 		}
-		if ok, _ := regexp.MatchString(`^[A-Za-z0-9.-]+$`, srv.Host); !ok {
+		if !hostPattern.MatchString(srv.Host) {
 			return fmt.Errorf("host contains invalid characters")
 		}
 		if strings.HasPrefix(srv.Host, ".") || strings.HasSuffix(srv.Host, ".") {
@@ -106,7 +144,62 @@ func validateServer(srv domain.Server) error {
 	if srv.Port != 0 && (srv.Port < 1 || srv.Port > 65535) {
 		return fmt.Errorf("port must be a number between 1 and 65535")
 	}
+	for _, rule := range forwardRulesOf(srv) {
+		if err := validateForwardSpec(rule); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// forwardRulesOf collects every forwarding rule declared on a server.
+func forwardRulesOf(srv domain.Server) []domain.ForwardRule {
+	var rules []domain.ForwardRule
+	for _, spec := range srv.LocalForward {
+		rules = append(rules, domain.ForwardRule{Kind: domain.ForwardLocal, Spec: spec})
+	}
+	for _, spec := range srv.RemoteForward {
+		rules = append(rules, domain.ForwardRule{Kind: domain.ForwardRemote, Spec: spec})
+	}
+	for _, spec := range srv.DynamicForward {
+		rules = append(rules, domain.ForwardRule{Kind: domain.ForwardDynamic, Spec: spec})
+	}
+	return rules
+}
+
+// validateForwardSpec performs a light structural check on a forward spec.
+func validateForwardSpec(rule domain.ForwardRule) error {
+	spec := strings.TrimSpace(rule.Spec)
+	if spec == "" {
+		return nil
+	}
+	switch rule.Kind {
+	case domain.ForwardDynamic:
+		// host:port or port
+		if _, err := parseForwardPort(spec); err != nil {
+			return fmt.Errorf("invalid DynamicForward %q: %w", spec, err)
+		}
+	default:
+		// [bind:]port:host:hostport
+		if strings.Count(spec, ":") < 2 {
+			return fmt.Errorf("invalid %s forward %q: expected [bind:]port:host:hostport", rule.Kind, spec)
+		}
+	}
+	return nil
+}
+
+// parseForwardPort parses the trailing port of a spec like "1080" or "127.0.0.1:1080".
+func parseForwardPort(spec string) (int, error) {
+	idx := strings.LastIndex(spec, ":")
+	portStr := spec
+	if idx >= 0 {
+		portStr = spec[idx+1:]
+	}
+	p, err := strconv.Atoi(portStr)
+	if err != nil || p < 1 || p > 65535 {
+		return 0, fmt.Errorf("port must be 1-65535")
+	}
+	return p, nil
 }
 
 // UpdateServer updates an existing server with new details.
@@ -153,6 +246,15 @@ func (s *serverService) SetPinned(alias string, pinned bool) error {
 	return err
 }
 
+// RecordConnect bumps the connect counter and last-seen timestamp for alias.
+func (s *serverService) RecordConnect(alias string) error {
+	err := s.serverRepository.RecordSSH(alias)
+	if err != nil {
+		s.logger.Errorw("failed to record ssh metadata", "alias", alias, "error", err)
+	}
+	return err
+}
+
 // SSH starts an interactive SSH session to the given alias using the system's ssh client.
 func (s *serverService) SSH(alias string) error {
 	s.logger.Infow("ssh start", "alias", alias)
@@ -164,11 +266,9 @@ func (s *serverService) SSH(alias string) error {
 		s.logger.Errorw("ssh command failed", "alias", alias, "error", err)
 		return err
 	}
-
-	if err := s.serverRepository.RecordSSH(alias); err != nil {
-		s.logger.Errorw("failed to record ssh metadata", "alias", alias, "error", err)
+	if err := s.RecordConnect(alias); err != nil {
+		return err
 	}
-
 	s.logger.Infow("ssh end", "alias", alias)
 	return nil
 }
@@ -187,154 +287,65 @@ func (s *serverService) SSHWithArgs(alias string, extraArgs []string) error {
 		s.logger.Errorw("ssh (with args) failed", "alias", alias, "error", err)
 		return err
 	}
-	if err := s.serverRepository.RecordSSH(alias); err != nil {
-		s.logger.Errorw("failed to record ssh metadata", "alias", alias, "error", err)
+	if err := s.RecordConnect(alias); err != nil {
+		return err
 	}
 	s.logger.Infow("ssh end (with args)", "alias", alias)
 	return nil
 }
 
-// StartForward starts ssh port forwarding in the background and tracks the process.
-func (s *serverService) StartForward(alias string, extraArgs []string) (int, error) {
-	s.fwMu.Lock()
-	if s.forwards == nil {
-		s.forwards = make(map[string][]*os.Process)
-	}
-	s.fwMu.Unlock()
-
-	extraArgs = append(extraArgs, "-N", alias)
-
-	// #nosec G204
-	cmd := exec.Command("ssh", extraArgs...)
-
-	// Detach from TTY: discard stdio
-	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-	if err != nil {
-		return 0, fmt.Errorf("failed to open devnull: %w", err)
-	}
-	defer func() {
-		if devNull != nil {
-			_ = devNull.Close()
-		}
-	}()
-
-	cmd.Stdin = devNull
-	cmd.Stdout = devNull
-	cmd.Stderr = devNull
-	// Set SysProcAttr in an OS-specific way (see sysprocattr_* files)
-	sysProcAttr := &syscall.SysProcAttr{}
-	setDetach(sysProcAttr)
-	cmd.SysProcAttr = sysProcAttr
-
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("failed to start ssh: %w", err)
-	}
-
-	proc := cmd.Process
-	if proc == nil {
-		return 0, fmt.Errorf("process is nil after start")
-	}
-	pid := proc.Pid
-
-	// Track process
-	s.fwMu.Lock()
-	s.forwards[alias] = append(s.forwards[alias], proc)
-	s.fwMu.Unlock()
-
-	// Cleanup on exit
-	go func(a string, c *exec.Cmd, dn *os.File) {
-		_ = c.Wait()
-		_ = dn.Close()
-
-		s.fwMu.Lock()
-		defer s.fwMu.Unlock()
-
-		procs := s.forwards[a]
-		if len(procs) == 0 {
-			return
-		}
-
-		filtered := make([]*os.Process, 0, len(procs))
-		for _, p := range procs {
-			if p != nil && p.Pid != pid {
-				filtered = append(filtered, p)
-			}
-		}
-
-		if len(filtered) == 0 {
-			delete(s.forwards, a)
-		} else {
-			s.forwards[a] = filtered
-		}
-	}(alias, cmd, devNull)
-
-	devNull = nil // Prevent defer from closing it
-
-	return pid, nil
-}
-
-// StopForwarding kills all active forward processes for the alias.
-func (s *serverService) StopForwarding(alias string) error {
-	s.fwMu.Lock()
-	procs := s.forwards[alias]
-	delete(s.forwards, alias)
-	s.fwMu.Unlock()
-
-	if len(procs) == 0 {
-		return nil
-	}
-
-	var errs []error
-	for _, p := range procs {
-		if p != nil {
-			if err := p.Signal(syscall.SIGTERM); err != nil {
-				// If SIGTERM fails, try SIGKILL
-				if killErr := p.Kill(); killErr != nil {
-					errs = append(errs, fmt.Errorf("failed to kill pid %d: %w", p.Pid, killErr))
-				}
-			}
-		}
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("errors stopping forwards: %v", errs)
-	}
-	return nil
-}
-
-// IsForwarding reports whether there is at least one active forward for alias.
-func (s *serverService) IsForwarding(alias string) bool {
-	s.fwMu.Lock()
-	defer s.fwMu.Unlock()
-	return len(s.forwards[alias]) > 0
-}
-
-// Ping checks if the server is reachable on its SSH port.
+// Ping checks if the server is reachable on its SSH port, with a short-lived
+// cache and a bounded number of concurrent probes.
 func (s *serverService) Ping(server domain.Server) (bool, time.Duration, error) {
+	key := server.Alias
+	if key == "" {
+		key = net.JoinHostPort(server.Host, strconv.Itoa(server.Port))
+	}
+
+	s.pingMu.Lock()
+	cached, ok := s.pingCache[key]
+	s.pingMu.Unlock()
+	if ok && time.Since(cached.at) < pingCacheTTL {
+		return cached.up, cached.latency, cached.err
+	}
+
+	if s.pingSem != nil {
+		s.pingSem <- struct{}{}
+		defer func() { <-s.pingSem }()
+	}
+
 	start := time.Now()
-
-	host, port, ok := resolveSSHDestination(server.Alias)
-	if !ok {
-
+	host, port, err := s.ResolveDestination(server.Alias)
+	if err != nil || host == "" {
 		host = strings.TrimSpace(server.Host)
 		if host == "" {
 			host = server.Alias
 		}
-		if server.Port > 0 {
-			port = server.Port
-		} else {
+		port = server.Port
+		if port == 0 {
 			port = 22
 		}
 	}
-	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 
-	dialer := net.Dialer{Timeout: 3 * time.Second}
-	conn, err := dialer.Dial("tcp", addr)
-	if err != nil {
-		return false, time.Since(start), err
+	dialer := net.Dialer{Timeout: sshDialTimeout}
+	conn, dialErr := dialer.Dial("tcp", addr)
+	latency := time.Since(start)
+	up := dialErr == nil
+	if conn != nil {
+		_ = conn.Close()
 	}
-	_ = conn.Close()
-	return true, time.Since(start), nil
+
+	s.pingMu.Lock()
+	s.pingCache[key] = pingResult{up: up, latency: latency, err: dialErr, at: time.Now()}
+	s.pingMu.Unlock()
+
+	return up, latency, dialErr
+}
+
+// ResolveDestination resolves alias to the host and port OpenSSH would use.
+func (s *serverService) ResolveDestination(alias string) (string, int, error) {
+	return resolveSSHDestination(alias)
 }
 
 // GetRawConfigBlock returns the raw SSH config text block for the given alias.
@@ -343,8 +354,63 @@ func (s *serverService) GetRawConfigBlock(alias string) (string, error) {
 }
 
 // controlPath returns the ControlMaster socket path for the given alias.
+//
+// The socket lives under the user's runtime dir (0700, per-user) with a hashed
+// name: a predictable /tmp/lazyssh-cm-<alias> could be pre-created by another
+// local user to hijack the multiplexed connection.
 func controlPath(alias string) string {
-	return fmt.Sprintf("/tmp/lazyssh-cm-%s", alias)
+	return filepath.Join(controlDir(), controlSocketName(alias))
+}
+
+// controlSocketName hashes the alias so arbitrary characters and long names
+// cannot escape the directory or exceed the sun_path limit.
+func controlSocketName(alias string) string {
+	sum := sha256.Sum256([]byte(alias))
+	return fmt.Sprintf("cm-%x", sum[:10])
+}
+
+// controlDir returns (and creates) the directory holding our control sockets.
+// controlDir returns a private, writable directory for ControlMaster sockets.
+//
+// The previous version ignored MkdirAll's error and handed back a path that did
+// not exist. ssh then failed with "unix_listener: cannot bind to path … No such
+// file or directory", the batch probe failed, and every connection fell through
+// to the password prompt even with working key auth. A read-only or missing
+// XDG_RUNTIME_DIR is common enough (containers, sudo, some CI) that this must
+// degrade to the temp dir instead of failing.
+func controlDir() string {
+	name := fmt.Sprintf("lazyssh-%d", os.Getuid())
+
+	candidates := make([]string, 0, 2)
+	if base := os.Getenv("XDG_RUNTIME_DIR"); base != "" {
+		candidates = append(candidates, filepath.Join(base, name))
+	}
+	candidates = append(candidates, filepath.Join(os.TempDir(), name))
+
+	for _, dir := range candidates {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			continue
+		}
+		if probeWritable(dir) {
+			return dir
+		}
+	}
+	// Nothing writable: return the temp path anyway so ssh reports a clear error
+	// rather than us silently pretending a directory exists.
+	return candidates[len(candidates)-1]
+}
+
+// probeWritable checks that a directory really accepts files (MkdirAll succeeds
+// on an existing directory even when the filesystem is read-only).
+func probeWritable(dir string) bool {
+	f, err := os.CreateTemp(dir, ".probe-*")
+	if err != nil {
+		return false
+	}
+	name := f.Name()
+	_ = f.Close()
+	_ = os.Remove(name)
+	return true
 }
 
 // SSHMasterExists checks whether a ControlMaster socket for alias is alive.
@@ -356,8 +422,7 @@ func (s *serverService) SSHMasterExists(alias string) bool {
 }
 
 // EstablishSSHMaster starts a ControlMaster connection for alias (blocks until
-// the connection is established or fails). The caller is expected to invoke this
-// via tea.ExecProcess so that interactive prompts (2FA/OTP) reach the terminal.
+// the connection is established or fails).
 func (s *serverService) EstablishSSHMaster(alias string) error {
 	if s.SSHMasterExists(alias) {
 		return nil
@@ -367,7 +432,7 @@ func (s *serverService) EstablishSSHMaster(alias string) error {
 	cmd := exec.Command("ssh",
 		"-o", "ControlMaster=yes",
 		"-o", "ControlPath="+cp,
-		"-o", "ControlPersist=600",
+		"-o", "ControlPersist="+controlPersistSec,
 		"-N",
 		alias,
 	)
@@ -375,14 +440,14 @@ func (s *serverService) EstablishSSHMaster(alias string) error {
 }
 
 // TrySSHMasterBatch attempts to establish a ControlMaster without any interactive
-// prompts (BatchMode=yes). Succeeds for key-based auth; fails fast otherwise.
+// prompts (BatchMode=yes).
 func (s *serverService) TrySSHMasterBatch(alias string) error {
 	cp := controlPath(alias)
 	// #nosec G204
 	cmd := exec.Command("ssh",
 		"-o", "ControlMaster=yes",
 		"-o", "ControlPath="+cp,
-		"-o", "ControlPersist=600",
+		"-o", "ControlPersist="+controlPersistSec,
 		"-o", "BatchMode=yes",
 		"-o", "ConnectTimeout=5",
 		"-N", alias,
@@ -391,36 +456,33 @@ func (s *serverService) TrySSHMasterBatch(alias string) error {
 }
 
 // EstablishSSHMasterWithPassword establishes a ControlMaster using a temporary
-// SSH_ASKPASS script that echoes the provided password/OTP, so the TUI is never
-// suspended and the user never sees a raw terminal prompt.
+// SSH_ASKPASS script.
+//
+// The secret is handed to the script through the environment, never interpolated
+// into shell source: formatting it with %q produced double quotes that a POSIX
+// shell still expands, so a password like a$(id)b executed a command.
 func (s *serverService) EstablishSSHMasterWithPassword(alias, password string) error {
 	if s.SSHMasterExists(alias) {
 		return nil
 	}
 	cp := controlPath(alias)
 
-	// Write a temporary askpass script that echoes the password.
-	f, err := os.CreateTemp("", "lazyssh-askpass-*.sh")
+	dir, err := os.MkdirTemp("", "lazyssh-askpass-*")
 	if err != nil {
-		return fmt.Errorf("failed to create askpass script: %w", err)
+		return fmt.Errorf("failed to create askpass dir: %w", err)
 	}
-	scriptPath := f.Name()
-	defer os.Remove(scriptPath) //nolint:errcheck
+	defer os.RemoveAll(dir) //nolint:errcheck
 
-	_, err = fmt.Fprintf(f, "#!/bin/sh\necho %q\n", password)
-	f.Close()
-	if err != nil {
-		return err
-	}
-	if err := os.Chmod(scriptPath, 0700); err != nil {
-		return err
+	scriptPath := filepath.Join(dir, "askpass.sh")
+	if err := os.WriteFile(scriptPath, []byte(askpassScript()), 0o700); err != nil {
+		return fmt.Errorf("failed to write askpass script: %w", err)
 	}
 
 	// #nosec G204
 	cmd := exec.Command("ssh",
 		"-o", "ControlMaster=yes",
 		"-o", "ControlPath="+cp,
-		"-o", "ControlPersist=600",
+		"-o", "ControlPersist="+controlPersistSec,
 		"-o", "ConnectTimeout=10",
 		"-N", alias,
 	)
@@ -428,6 +490,7 @@ func (s *serverService) EstablishSSHMasterWithPassword(alias, password string) e
 		"SSH_ASKPASS="+scriptPath,
 		"SSH_ASKPASS_REQUIRE=force",
 		"DISPLAY=:0",
+		"LAZYSSH_ASKPASS_SECRET="+password,
 	)
 	cmd.Stdin = nil
 
@@ -435,14 +498,11 @@ func (s *serverService) EstablishSSHMasterWithPassword(alias, password string) e
 	setDetach(sysProcAttr)
 	cmd.SysProcAttr = sysProcAttr
 
-	// Start (don't Run): ssh -N with ControlPersist never exits on its own.
-	// We start it in the background and poll for the socket to appear.
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start ssh master: %w", err)
 	}
 	go func() { _ = cmd.Wait() }()
 
-	// Poll up to 10 s for the ControlMaster socket to be ready.
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if s.SSHMasterExists(alias) {
@@ -461,35 +521,64 @@ func (s *serverService) CloseSSHMaster(alias string) error {
 	return cmd.Run()
 }
 
-// resolveSSHDestination uses `ssh -G <alias>` to extract HostName and Port from the user's SSH config.
-// Returns host, port, ok where ok=false if resolution failed.
-func resolveSSHDestination(alias string) (string, int, bool) {
+// ValidateConfig parses the ssh config and reports problems without touching it.
+func (s *serverService) ValidateConfig() ([]string, error) {
+	servers, err := s.serverRepository.ListServers("")
+	if err != nil {
+		return nil, err
+	}
+	var problems []string
+	seen := make(map[string]int)
+	for _, srv := range servers {
+		seen[srv.Alias]++
+		if srv.Host == "" {
+			problems = append(problems, fmt.Sprintf("%s: missing HostName", srv.Alias))
+		}
+		if err := validateServer(srv); err != nil {
+			problems = append(problems, fmt.Sprintf("%s: %v", srv.Alias, err))
+		}
+		for _, rule := range forwardRulesOf(srv) {
+			if err := validateForwardSpec(rule); err != nil {
+				problems = append(problems, fmt.Sprintf("%s: %v", srv.Alias, err))
+			}
+		}
+	}
+	for alias, n := range seen {
+		if n > 1 {
+			problems = append(problems, fmt.Sprintf("%s: defined %d times", alias, n))
+		}
+	}
+	sort.Strings(problems)
+	return problems, nil
+}
+
+// resolveSSHDestination uses `ssh -G <alias>` to extract HostName and Port.
+func resolveSSHDestination(alias string) (string, int, error) {
 	alias = strings.TrimSpace(alias)
 	if alias == "" {
-		return "", 0, false
+		return "", 0, fmt.Errorf("empty alias")
 	}
+	// #nosec G204
 	cmd := exec.Command("ssh", "-G", alias)
 	out, err := cmd.Output()
 	if err != nil {
-		return "", 0, false
+		return "", 0, err
 	}
 	host := ""
 	port := 0
 	scanner := bufio.NewScanner(strings.NewReader(string(out)))
 	for scanner.Scan() {
 		line := scanner.Text()
-		if strings.HasPrefix(line, "hostname ") {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				host = parts[1]
-			}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
 		}
-		if strings.HasPrefix(line, "port ") {
-			parts := strings.Fields(line)
-			if len(parts) >= 2 {
-				if p, err := strconv.Atoi(parts[1]); err == nil {
-					port = p
-				}
+		switch strings.ToLower(fields[0]) {
+		case "hostname":
+			host = fields[1]
+		case "port":
+			if p, err := strconv.Atoi(fields[1]); err == nil {
+				port = p
 			}
 		}
 	}
@@ -499,5 +588,13 @@ func resolveSSHDestination(alias string) (string, int, bool) {
 	if port == 0 {
 		port = 22
 	}
-	return host, port, true
+	return host, port, nil
+}
+
+// askpassScript is the SSH_ASKPASS helper. It reads the secret from the
+// environment, so a password containing shell metacharacters (a$(id)b, quotes,
+// newlines) is never interpreted. The previous implementation interpolated it
+// into the script with %q, which a POSIX shell still expands.
+func askpassScript() string {
+	return "#!/bin/sh\nprintf '%s\\n' \"$LAZYSSH_ASKPASS_SECRET\"\n"
 }

@@ -77,11 +77,42 @@ func (m *metadataManager) saveAll(metadata map[string]ServerMetadata) error {
 		return fmt.Errorf("marshal metadata for '%s': %w", m.filePath, err)
 	}
 
-	if err := os.WriteFile(m.filePath, data, 0o600); err != nil {
+	// Write-then-rename so a crash (or a second lazyssh instance) never leaves a
+	// truncated metadata.json behind. The previous os.WriteFile truncated the
+	// file in place, which loses every pin/tag/connect count on partial writes.
+	if err := writeFileAtomic(m.filePath, data, 0o600); err != nil {
 		m.logger.Errorw("failed to write metadata file", "path", m.filePath, "error", err)
 		return fmt.Errorf("write metadata '%s': %w", m.filePath, err)
 	}
 	return nil
+}
+
+// writeFileAtomic writes data to path via a temp file in the same directory
+// followed by an atomic rename.
+func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) //nolint:errcheck
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func (m *metadataManager) updateServer(server domain.Server, oldAlias string) error {

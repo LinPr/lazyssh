@@ -33,3 +33,6 @@ go.work.sum
 # .vscode/
 
 lazyssh
+
+# local verification harness (PTY capture, screenshots, fake HOME, tool cache)
+.work/

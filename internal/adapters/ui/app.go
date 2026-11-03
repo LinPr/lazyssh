@@ -20,12 +20,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/atotto/clipboard"
-	"github.com/charmbracelet/x/ansi"
 	"charm.land/bubbles/v2/list"
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/atotto/clipboard"
+	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/vt"
 	"github.com/linpr/lazyssh/internal/core/domain"
 	"github.com/linpr/lazyssh/internal/core/ports"
 )
@@ -42,36 +44,67 @@ const (
 	StateFormPreview
 	StateFileBrowser
 	StateSSHAuthInput
-	StateSessionView // embedded PTY tab sessions
+	StateSessionView // full-screen multi-session tab view
+	StateForwards    // port-forwarding manager
+	StateKeys        // ssh key manager
+	StateKnownHosts  // known_hosts manager
+	StateTextPrompt  // generic single-line prompt (mkdir/rename/confirm/…)
+	StatePalette     // Ctrl+K command palette
 )
 
 type AppModel struct {
-	state         AppState
-	serverService ports.ServerService
-	servers       []domain.Server
-	list          list.Model
-	search        textinput.Model
-	details       DetailsModel
-	form          FormModel
-	formPreview   FormSavePreviewMsg
-	help          HelpModel
-	statusBar     StatusBar
-	deleteTarget  *domain.Server
-	previewText   string
-	pingNotice    string
-	sortMode      int
-	searching     bool
-	width, height int
-	version       string
-	commit        string
-	pingStatus    map[string]*bool
-	fileBrowser   FileBrowserModel
-	sshAuthInput  textinput.Model
-	sshAuthAlias  string
-	sshAuthServer domain.Server
+	state              AppState
+	serverService      ports.ServerService
+	servers            []domain.Server
+	list               list.Model
+	search             textinput.Model
+	details            DetailsModel
+	form               FormModel
+	formPreview        FormSavePreviewMsg
+	help               HelpModel
+	statusBar          StatusBar
+	deleteTarget       *domain.Server
+	previewText        string
+	pingNotice         string
+	sortMode           SortMode
+	theme              Theme
+	searching          bool
+	width, height      int
+	version            string
+	commit             string
+	pingStatus         map[string]*bool
+	fileBrowser        FileBrowserModel
+	sshAuthInput       textinput.Model
+	sshAuthAlias       string
+	sshAuthServer      domain.Server
 	sessions           SessionsModel
 	activeSessionAlias string // alias shown in the right-panel overlay ("" = show details)
 	terminalFocused    bool   // true = keys forwarded to PTY; false = left panel navigable
+
+	detailsFocused bool // true = j/k scroll the config pane instead of the list
+
+	// forwards panel
+	forwards    []domain.ForwardStatus
+	forwardsCur int
+	pendingStop string
+
+	// key manager
+	keys       []domain.SSHKey
+	keysCur    int
+	keysStatus string
+
+	// known_hosts manager
+	knownHosts    []domain.KnownHostEntry
+	knownHostsCur int
+	knownHostsMsg string
+
+	// generic text prompt
+	promptLabel  string
+	promptValue  textinput.Model
+	promptAction string // identifies what to do on submit
+	promptTarget string // alias/path the prompt applies to
+
+	palette paletteState
 }
 
 // Message types
@@ -124,8 +157,14 @@ func NewApp(ss ports.ServerService, version, commit string) *AppModel {
 	l.Styles.Title = ListTitleStyle
 	l.SetShowHelp(false)
 
-	// Register the IsForwarding hook
-	IsForwarding = ss.IsForwarding
+	// Register the IsForwarding hook (nil-safe: tests build an app without a
+	// service, and a missing hook must not panic at construction time).
+	if ss != nil {
+		IsForwarding = ss.IsForwarding
+	}
+
+	// Seed the package-level styles with the default palette.
+	applyTheme(ThemeLight)
 
 	return &AppModel{
 		state:         StateList,
@@ -136,6 +175,7 @@ func NewApp(ss ports.ServerService, version, commit string) *AppModel {
 		statusBar:     StatusBar{},
 		version:       version,
 		commit:        commit,
+		theme:         ThemeLight,
 	}
 }
 
@@ -181,6 +221,10 @@ func pingAllServers(ss ports.ServerService, servers []domain.Server) tea.Cmd {
 }
 
 // selectedServer returns the currently selected server, or nil.
+//
+// m.servers is already ordered for display (applySort runs after every load and
+// sort change) and m.list holds the same rows in the same order, so the list
+// cursor indexes straight into it.
 func (m *AppModel) selectedServer() *domain.Server {
 	if len(m.servers) == 0 {
 		return nil
@@ -190,6 +234,12 @@ func (m *AppModel) selectedServer() *domain.Server {
 		return nil
 	}
 	return &m.servers[idx]
+}
+
+// applySort reorders m.servers and re-renders the list rows in that order.
+func (m *AppModel) applySort() {
+	sortServers(m.servers, m.sortMode)
+	m.updateListItems()
 }
 
 // updateDetailsForSelected loads config for the selected server and auto-switches
@@ -220,7 +270,8 @@ func (m *AppModel) updateDetailsForSelected() {
 	m.details.SetRawConfig(raw)
 }
 
-// updateListItems rebuilds list items from m.servers, injecting current ping status.
+// updateListItems rebuilds list items from m.servers, injecting current ping,
+// session and forwarding state. Row order always mirrors m.servers.
 func (m *AppModel) updateListItems() {
 	items := make([]list.Item, len(m.servers))
 	for i, s := range m.servers {
@@ -228,10 +279,26 @@ func (m *AppModel) updateListItems() {
 			Server:        s,
 			PingStatus:    m.pingStatus[s.Alias],
 			SessionActive: m.sessions.findByAlias(s.Alias) != nil,
+			Forwarding:    m.isForwarding(s.Alias),
 		}
 	}
 	m.list.SetItems(items)
 	m.updateDetailsForSelected()
+}
+
+// isForwarding consults the service (cheap, map lookup) so the row badge tracks
+// reality instead of the never-read global hook.
+func (m *AppModel) isForwarding(alias string) bool {
+	if m.serverService == nil {
+		return false
+	}
+	return m.serverService.IsForwarding(alias)
+}
+
+// refreshForwardBadges re-renders rows after a forward starts or stops.
+func (m *AppModel) refreshForwardBadges() {
+	m.updateListItems()
+	m.forwards = m.serverService.ForwardStatuses()
 }
 
 // Update handles all incoming messages.
@@ -242,13 +309,17 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		// Sizes must be pushed into the components here: View runs on a copy, so
+		// any SetSize done there would be thrown away (this is what left the list
+		// with height 0 and a single visible row).
+		m.applyLayout()
 		m.sessions.width = msg.Width
 		m.sessions.height = msg.Height
 		m.sessions.resizeAll()
 
 	case ServersLoadedMsg:
 		m.servers = []domain.Server(msg)
-		m.updateListItems()
+		m.applySort()
 		cmds = append(cmds, pingAllServers(m.serverService, m.servers))
 
 	case PingStatusMsg:
@@ -311,6 +382,38 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case CloseSSHMasterMsg:
 		go m.serverService.CloseSSHMaster(msg.Alias) //nolint:errcheck
 
+	case ForwardActionMsg:
+		var cmd tea.Cmd
+		switch {
+		case msg.Err != nil:
+			m.statusBar, cmd = m.statusBar.Show("Forward "+msg.Alias+": "+msg.Err.Error(), colorErrHex)
+		case msg.Started:
+			m.statusBar, cmd = m.statusBar.Show("Forwarding started for "+msg.Alias, colorOKHex)
+		case msg.Stopped:
+			m.statusBar, cmd = m.statusBar.Show("Forwarding stopped for "+msg.Alias, colorOKHex)
+		}
+		m.refreshForwardBadges()
+		m.forwardsCur = clampInt(m.forwardsCur, 0, max(0, len(m.forwards)-1))
+		cmds = append(cmds, cmd)
+
+	case KeysLoadedMsg:
+		m.keys = msg.Keys
+		m.keysCur = clampInt(m.keysCur, 0, max(0, len(m.keys)-1))
+		if msg.Err != nil {
+			m.keysStatus = "error: " + msg.Err.Error()
+		} else if len(m.keys) == 0 {
+			m.keysStatus = "No private keys found in ~/.ssh."
+		} else {
+			m.keysStatus = ""
+		}
+
+	case KnownHostsLoadedMsg:
+		m.knownHosts = msg.Entries
+		m.knownHostsCur = clampInt(m.knownHostsCur, 0, max(0, len(m.knownHosts)-1))
+		if msg.Err != nil {
+			m.knownHostsMsg = "error: " + msg.Err.Error()
+		}
+
 	case SSHAuthInputMsg:
 		if s := m.selectedServer(); s != nil {
 			m.sshAuthAlias = s.Alias
@@ -334,6 +437,11 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if tab := m.sessions.findByAlias(msg.Alias); tab != nil {
 			m.updateListItems() // refresh 🟢 indicators
 			return m, waitForPtyOutput(tab)
+		}
+
+	case sessionTickMsg:
+		if tab := m.sessions.findByAlias(msg.Alias); tab != nil && !tab.closed {
+			return m, sessionRedraw(msg.Alias)
 		}
 
 	case SessionClosedMsg:
@@ -414,7 +522,22 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(append(cmds, inputCmd)...)
 
 	case StateSessionView:
-		return m.updateStateSession(msg, cmds)
+		return m.updateStateSession(msg)
+
+	case StateForwards:
+		return m.updateForwards(msg)
+
+	case StateKeys:
+		return m.updateKeys(msg)
+
+	case StateKnownHosts:
+		return m.updateKnownHosts(msg)
+
+	case StateTextPrompt:
+		return m.updatePrompt(msg)
+
+	case StatePalette:
+		return m.updatePalette(msg)
 	}
 
 	return m, tea.Batch(cmds...)
@@ -422,6 +545,20 @@ func (m AppModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
+
+	// Wheel over the embedded terminal pane scrolls its history; elsewhere the
+	// wheel keeps the default behaviour (bubbles' list scrolls itself).
+	if handled, cmd := m.handleEmbeddedTerminalMouse(msg); handled {
+		return m, tea.Batch(append(cmds, cmd)...)
+	}
+	// Paste while the embedded terminal is focused must go to the PTY, not to the
+	// search box.
+	if paste, ok := msg.(tea.PasteMsg); ok && m.terminalFocused && !m.searching {
+		if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.closed {
+			tab.paste(paste.Content)
+			return m, tea.Batch(cmds...)
+		}
+	}
 
 	switch msg := msg.(type) {
 	case tea.KeyPressMsg:
@@ -444,6 +581,14 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.sessions.prevTab()
 				if tab := m.sessions.activeTab(); tab != nil {
 					m.activeSessionAlias = tab.server.Alias
+				}
+				return m, tea.Batch(cmds...)
+			case "ctrl+v", "ctrl+shift+v":
+				if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.closed && !tab.altScreen() {
+					return m.pasteIntoSession(tab)
+				}
+				if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil && !tab.closed {
+					tab.writeInput([]byte{0x16}) // vim/less keep their own Ctrl+V
 				}
 				return m, tea.Batch(cmds...)
 			default:
@@ -476,29 +621,19 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.searching = false
 				m.search.Blur()
 				m.search.SetValue("")
+				m.applyLayout()
 				cmds = append(cmds, loadServers(m.serverService, ""))
 				return m, tea.Batch(cmds...)
 			case "enter":
 				m.searching = false
 				m.search.Blur()
+				m.applyLayout()
 				return m, tea.Batch(cmds...)
 			default:
 				var cmd tea.Cmd
 				m.search, cmd = m.search.Update(msg)
 				cmds = append(cmds, cmd)
-				q := m.search.Value()
-				if strings.Contains(q, "#") {
-					tags, text := parseSearchTokens(q)
-					filtered := filterServers(m.servers, tags, text)
-					items := make([]list.Item, len(filtered))
-					for i, s := range filtered {
-						items[i] = ServerItem{Server: s, PingStatus: m.pingStatus[s.Alias]}
-					}
-					m.list.SetItems(items)
-					m.updateDetailsForSelected()
-				} else {
-					cmds = append(cmds, loadServers(m.serverService, q))
-				}
+				cmds = append(cmds, loadServers(m.serverService, m.search.Value()))
 				return m, tea.Batch(cmds...)
 			}
 		}
@@ -510,6 +645,7 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "/":
 			m.searching = true
 			m.search.Focus()
+			m.applyLayout()
 			return m, textinput.Blink
 
 		case "a":
@@ -604,32 +740,73 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "F":
 			if s := m.selectedServer(); s != nil {
-				_, err := m.serverService.StartForward(s.Alias, nil)
+				alias := s.Alias
+				svc := m.serverService
+				rules := svc.ForwardRules(alias)
 				var cmd tea.Cmd
-				if err != nil {
-					m.statusBar, cmd = m.statusBar.Show("Forward failed: "+err.Error(), "#f7768e")
-				} else {
-					m.statusBar, cmd = m.statusBar.Show("Forwarding started for "+s.Alias, "")
+				if len(rules) == 0 {
+					m.statusBar, cmd = m.statusBar.Show(
+						alias+" declares no LocalForward/RemoteForward/DynamicForward", colorWarnHex)
+					cmds = append(cmds, cmd)
+					break
 				}
+				m.statusBar, cmd = m.statusBar.Show("Starting forward for "+alias+"…", "")
 				cmds = append(cmds, cmd)
+				cmds = append(cmds, func() tea.Msg {
+					_, err := svc.StartForward(alias, rules, nil)
+					if err != nil {
+						return ForwardActionMsg{Alias: alias, Err: err}
+					}
+					return ForwardActionMsg{Alias: alias, Started: true}
+				})
 			}
 
 		case "x":
 			if s := m.selectedServer(); s != nil {
-				err := m.serverService.StopForwarding(s.Alias)
-				var cmd tea.Cmd
-				if err != nil {
-					m.statusBar, cmd = m.statusBar.Show("Stop forward failed: "+err.Error(), "#f7768e")
-				} else {
-					m.statusBar, cmd = m.statusBar.Show("Forwarding stopped for "+s.Alias, "")
-				}
-				cmds = append(cmds, cmd)
+				alias := s.Alias
+				svc := m.serverService
+				cmds = append(cmds, func() tea.Msg {
+					return ForwardActionMsg{Alias: alias, Err: svc.StopForwarding(alias), Stopped: true}
+				})
+			}
+
+		case "V":
+			m.state = StateForwards
+			m.forwards = m.serverService.ForwardStatuses()
+			m.forwardsCur = clampInt(m.forwardsCur, 0, max(0, len(m.forwards)-1))
+			return m, nil
+
+		case "K":
+			m.state = StateKeys
+			m.keys = nil
+			m.keysStatus = "loading keys…"
+			svc := m.serverService
+			return m, func() tea.Msg {
+				keys, err := svc.ListSSHKeys()
+				return KeysLoadedMsg{Keys: keys, Err: err}
+			}
+
+		case "H":
+			m.state = StateKnownHosts
+			m.knownHosts = nil
+			svc := m.serverService
+			return m, func() tea.Msg {
+				entries, err := svc.ListKnownHosts()
+				return KnownHostsLoadedMsg{Entries: entries, Err: err}
 			}
 
 		case "s":
-			m.sortMode = (m.sortMode + 1) % 4
+			m.sortMode = m.sortMode.Next()
+			m.applySort()
 			var cmd tea.Cmd
-			m.statusBar, cmd = m.statusBar.Show(sortModeName(m.sortMode), "")
+			m.statusBar, cmd = m.statusBar.Show(m.sortMode.String(), "")
+			cmds = append(cmds, cmd)
+
+		case "t":
+			m.theme = m.theme.Next()
+			applyTheme(m.theme)
+			var cmd tea.Cmd
+			m.statusBar, cmd = m.statusBar.Show(m.theme.String(), "")
 			cmds = append(cmds, cmd)
 
 		case "right":
@@ -641,33 +818,59 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.terminalFocused = true
 					return m, tea.Batch(cmds...)
 				}
-				tab, err := newSession(*s, m.sessions.termCols(), m.sessions.termRows())
-				if err != nil {
-					var statusCmd tea.Cmd
-					m.statusBar, statusCmd = m.statusBar.Show("Session failed: "+err.Error(), "#f7768e")
-					cmds = append(cmds, statusCmd)
-				} else {
-					m.sessions.addSession(tab)
-					m.activeSessionAlias = s.Alias
-					m.terminalFocused = true
-					m.updateListItems()
-					return m, tea.Batch(append(cmds, waitForPtyOutput(tab))...)
-				}
+				// Delegate to the shared opener so "->" and "o" behave identically.
+				srv := *s
+				openCmd := m.openSessionInTab(srv)
+				return m, tea.Batch(append(cmds, openCmd)...)
 			}
 
 		case "enter":
 			if s := m.selectedServer(); s != nil {
 				alias := s.Alias
 				sshCmd := exec.Command("ssh", alias)
+				svc := m.serverService
 				return m, tea.ExecProcess(sshCmd, func(err error) tea.Msg {
 					if err != nil {
 						return StatusMsg{Text: "SSH error: " + err.Error(), Color: "#f7768e"}
 					}
-					return loadServers(m.serverService, "")()
+					// The previous code never recorded the connection, so the
+					// "connects" counter and the last-used sort stayed empty.
+					_ = svc.RecordConnect(alias)
+					return loadServers(svc, "")()
 				})
 			}
 
+		case "tab":
+			// Toggle focus between the server list and the config detail pane so
+			// long config blocks can be scrolled. (Rendering already works if
+			// details.Update is fed, but nothing used to call it.)
+			m.detailsFocused = !m.detailsFocused
+			hint := "list focused"
+			if m.detailsFocused {
+				hint = "details focused — j/k scroll"
+			}
+			var cmd tea.Cmd
+			m.statusBar, cmd = m.statusBar.Show(hint, "")
+			return m, cmd
+
+		case "o":
+			// Full-screen multi-session view (previously unreachable state).
+			if len(m.sessions.tabs) == 0 {
+				if s := m.selectedServer(); s != nil {
+					cmds = append(cmds, m.openSessionInTab(*s))
+				}
+				if len(m.sessions.tabs) == 0 {
+					return m, tea.Batch(cmds...)
+				}
+			}
+			m.state = StateSessionView
+			return m, tea.Batch(cmds...)
+
 		case "j", "down":
+			if m.detailsFocused {
+				m.details, _ = m.details.Update(msg)
+				return m, tea.Batch(cmds...)
+			}
 			var cmd tea.Cmd
 			m.list, cmd = m.list.Update(msg)
 			cmds = append(cmds, cmd)
@@ -675,11 +878,26 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Batch(cmds...)
 
 		case "k", "up":
+			if m.detailsFocused {
+				m.details, _ = m.details.Update(msg)
+				return m, tea.Batch(cmds...)
+			}
 			var cmd tea.Cmd
 			m.list, cmd = m.list.Update(msg)
 			cmds = append(cmds, cmd)
 			m.updateDetailsForSelected()
 			return m, tea.Batch(cmds...)
+
+		case "pgup", "pgdown", "ctrl+f", "ctrl+b":
+			if m.detailsFocused {
+				m.details, _ = m.details.Update(msg)
+			}
+			return m, tea.Batch(cmds...)
+
+		case "ctrl+k", ":":
+			m.palette = newPaletteState()
+			m.state = StatePalette
+			return m, textinput.Blink
 
 		case "?":
 			m.help = NewHelpModel(m.width, m.height)
@@ -703,55 +921,155 @@ func (m AppModel) updateStateList(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
-func (m AppModel) updateStateSession(msg tea.Msg, cmds []tea.Cmd) (tea.Model, tea.Cmd) {
+// updateStateSession handles input in the full-screen session view.
+//
+// Keys are forwarded to the active PTY. ctrl+\\ leaves the view (sessions stay
+// alive), ctrl+n/p cycle tabs and ctrl+w closes the active one.
+func (m AppModel) updateStateSession(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Mouse wheel browses history; a right click pastes.
+	if handled, cmd := m.handleSessionMouse(msg); handled {
+		return m, cmd
+	}
+	// Terminal paste (Ctrl+Shift+V / middle click in most emulators) arrives as a
+	// PasteMsg, not as key presses, so it needs its own branch.
+	if paste, ok := msg.(tea.PasteMsg); ok {
+		if tab := m.sessions.activeTab(); tab != nil && !tab.closed {
+			tab.paste(paste.Content)
+		}
+		return m, nil
+	}
+
 	kp, ok := msg.(tea.KeyPressMsg)
 	if !ok {
-		return m, tea.Batch(cmds...)
+		return m, nil
 	}
 
-	key := kp.String()
+	tab := m.sessions.activeTab()
+	scrolled := tab != nil && tab.isScrolledBack()
 
-	// Ctrl+A is our prefix key (like tmux's Ctrl+B).
-	// We track it via a simple flag embedded as a prefix in the key string.
-	// bubbletea reports it as "ctrl+a".
-	switch key {
-	case "ctrl+a":
-		// Next key will be interpreted as a session command; handled via a
-		// lightweight convention: store a flag and wait for the next event.
-		// For simplicity, use dedicated shortcuts directly.
-		return m, tea.Batch(cmds...)
+	switch key := kp.String(); key {
+	case "pgup":
+		if tab != nil && !tab.closed {
+			tab.scrollBy(bodyRows(m.height))
+		}
+		return m, nil
 
-	// Session-management shortcuts (no prefix required to keep it simple).
-	case "ctrl+\\": // return to list view, sessions stay alive
+	case "pgdown":
+		if tab != nil && !tab.closed {
+			tab.scrollBy(-bodyRows(m.height))
+		}
+		return m, nil
+
+	case "esc":
+		// Esc first jumps back to the live output, then leaves the view.
+		if scrolled {
+			tab.scrollToBottom()
+			return m, nil
+		}
+
+	case "ctrl+\\":
 		m.state = StateList
-		return m, tea.Batch(cmds...)
+		return m, nil
 
-	case "ctrl+n": // next tab
+	case "ctrl+n":
 		m.sessions.nextTab()
-		return m, tea.Batch(cmds...)
+		m.syncActiveSession()
+		return m, nil
 
-	case "ctrl+p": // prev tab
+	case "ctrl+p":
 		m.sessions.prevTab()
-		return m, tea.Batch(cmds...)
+		m.syncActiveSession()
+		return m, nil
 
-	case "ctrl+w": // close active tab
+	case "ctrl+v", "ctrl+shift+v":
+		// Some terminals do not emit a bracketed-paste event for their own paste
+		// shortcut, so map the usual keys to a clipboard paste as well.
+		// Inside a full-screen program (vim, less) Ctrl+V is a real binding
+		// (visual block), so only intercept it at an ordinary prompt.
+		if tab != nil && !tab.closed && !tab.altScreen() {
+			return m.pasteIntoSession(tab)
+		}
+		return m, nil
+
+	case "ctrl+w":
 		if tab := m.sessions.activeTab(); tab != nil {
-			alias := tab.server.Alias
-			m.sessions.removeByAlias(alias)
+			m.sessions.removeByAlias(tab.server.Alias)
+			m.updateListItems()
 			if len(m.sessions.tabs) == 0 {
 				m.state = StateList
+				m.activeSessionAlias = ""
+				m.terminalFocused = false
+				return m, nil
 			}
+			m.syncActiveSession()
 		}
-		return m, tea.Batch(cmds...)
+		return m, nil
+
+	case "ctrl+a":
+		// Reserved prefix; swallow so it never leaks into the remote shell.
+		return m, nil
 	}
 
-	// Forward all other keys to the active PTY.
 	if tab := m.sessions.activeTab(); tab != nil && !tab.closed {
-		if data := keyToBytes(key); data != nil {
+		// Typing always returns to the live view, like every terminal does.
+		if tab.isScrolledBack() {
+			tab.scrollToBottom()
+		}
+		if data := keyToBytes(kp.String()); data != nil {
 			tab.writeInput(data)
 		}
 	}
-	return m, tea.Batch(cmds...)
+	return m, nil
+}
+
+// handleSessionMouse maps wheel scrolling and right-click paste for the
+// full-screen session view. It reports whether the event was consumed.
+func (m AppModel) handleSessionMouse(msg tea.Msg) (bool, tea.Cmd) {
+	switch ev := msg.(type) {
+	case tea.MouseWheelMsg:
+		tab := m.sessions.activeTab()
+		if tab == nil || tab.closed {
+			return false, nil
+		}
+		// In the alternate screen the wheel belongs to the remote program
+		// (vim, less, htop), so forward it instead of scrolling our history.
+		if tab.altScreen() {
+			tab.sendMouse(wheelToMouse(ev))
+			return true, nil
+		}
+		switch ev.Button {
+		case tea.MouseWheelUp:
+			tab.scrollBy(wheelStep)
+		case tea.MouseWheelDown:
+			tab.scrollBy(-wheelStep)
+		}
+		return true, nil
+
+	case tea.MouseClickMsg:
+		if ev.Button != tea.MouseRight {
+			return false, nil
+		}
+		tab := m.sessions.activeTab()
+		if tab == nil || tab.closed {
+			return false, nil
+		}
+		text, err := clipboard.ReadAll()
+		if err != nil || text == "" {
+			var cmd tea.Cmd
+			m.statusBar, cmd = m.statusBar.Show("Clipboard is empty", colorWarnHex)
+			return true, cmd
+		}
+		tab.paste(text)
+		return true, nil
+	}
+	return false, nil
+}
+
+// syncActiveSession keeps the list overlay alias aligned with the active tab.
+func (m *AppModel) syncActiveSession() {
+	if tab := m.sessions.activeTab(); tab != nil {
+		m.activeSessionAlias = tab.server.Alias
+	}
 }
 
 func (m AppModel) updateStateDelete(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -828,17 +1146,35 @@ func (m AppModel) View() tea.View {
 		case StateFileBrowser:
 			v := tea.NewView(m.fileBrowser.ViewString())
 			v.AltScreen = true
+			v.MouseMode = tea.MouseModeCellMotion
 			return v
 
 		case StateSessionView:
 			v := tea.NewView(m.renderSessionView())
 			v.AltScreen = true
+			// Wheel events are only delivered when the application asks for them.
+			v.MouseMode = tea.MouseModeCellMotion
 			return v
 
 		case StateSSHAuthInput:
 			bg := m.viewBackground()
 			overlay := m.viewSSHAuthInput()
 			content = overlayCenter(bg, overlay, m.width, m.height)
+
+		case StateForwards:
+			content = m.viewForwards()
+
+		case StateKeys:
+			content = m.viewKeys()
+
+		case StateKnownHosts:
+			content = m.viewKnownHosts()
+
+		case StateTextPrompt:
+			content = m.viewPrompt()
+
+		case StatePalette:
+			content = m.viewPalette()
 
 		default:
 			// Normal list view
@@ -866,6 +1202,14 @@ func (m AppModel) View() tea.View {
 
 	v := tea.NewView(content)
 	v.AltScreen = true
+
+	// Mouse reporting is opt-in and disruptive: while it is on, the outer terminal
+	// stops doing its own text selection (most terminals restore it with Shift).
+	// Only ask for it where a wheel actually does something — the full-screen
+	// session view, and the embedded terminal once it has focus.
+	if m.state == StateSessionView || m.terminalFocused {
+		v.MouseMode = tea.MouseModeCellMotion
+	}
 	return v
 }
 
@@ -961,70 +1305,36 @@ func overlayCenter(base, box string, w, h int) string {
 }
 
 func (m AppModel) viewContent() string {
-	h := m.height
-	w := m.width
-	if h <= 0 || w <= 0 {
+	if m.height <= 0 || m.width <= 0 {
 		return ""
 	}
 
-	// Reserve 1 line for status bar
-	bodyH := h - 1
-	if bodyH < 3 {
-		bodyH = 3
-	}
+	// Sizes are configured in Update (see applyLayout); viewContent must only
+	// read them, because it runs on a copy of the model.
+	l := m.computeLayout()
 
-	// Left panel = 1/4, right panel = 3/4 of terminal width.
-	leftW := w / 4
-	if leftW < 18 {
-		leftW = 18
-	}
-	rightW := w - leftW
-
-	// Left panel: build manually so search never creates a separate box.
-	// Border overhead = 2 (top+bottom). Inner rows = bodyH - 2.
-	innerRows := bodyH - 2
-	if innerRows < 1 {
-		innerRows = 1
-	}
-	innerW := leftW - 4 // 2 border + 2 padding
-
-	// When searching: first inner row is the search input.
-	// List gets innerRows-1 rows. When not searching: list gets innerRows rows.
-	listRows := innerRows
 	var searchLine string
 	if m.searching {
-		listRows = innerRows - 1
-		if listRows < 1 {
-			listRows = 1
-		}
-		// Render search input as a single line inside the left border
 		searchLine = lipgloss.NewStyle().
-			Foreground(colorAccent).Bold(true).Width(innerW).
+			Foreground(colorAccent).Bold(true).Width(l.listInnerW).
 			Render("/ " + m.search.View())
 	}
 
-	// Resize list to fit
-	m.list.SetSize(innerW, listRows)
-
-	// Build left panel: border box containing [optional search] + list
 	var leftContent string
 	if m.searching {
 		leftContent = lipgloss.JoinVertical(lipgloss.Left, searchLine, m.list.View())
 	} else {
 		leftContent = m.list.View()
 	}
-	// Width(leftW): lipgloss v2 Width sets outer total, so pass leftW not innerW.
-	leftPane := ListBorderStyle.Width(leftW).Height(bodyH).Render(leftContent)
+	leftPane := ListBorderStyle.Width(l.leftW).Height(l.bodyH).Render(leftContent)
 
-	// Right panel: terminal overlay if a session is active, else config details
 	var rightPane string
 	if m.activeSessionAlias != "" {
 		if tab := m.sessions.findByAlias(m.activeSessionAlias); tab != nil {
-			rightPane = renderTerminalOverlay(tab, rightW, bodyH, m.terminalFocused)
+			rightPane = renderTerminalOverlay(tab, l.rightW, l.bodyH, m.terminalFocused)
 		}
 	}
 	if rightPane == "" {
-		m.details.SetSize(rightW, bodyH)
 		rightPane = m.details.View().Content
 	}
 
@@ -1292,4 +1602,116 @@ func filterServers(servers []domain.Server, tags []string, text string) []domain
 		result = append(result, s)
 	}
 	return result
+}
+
+// openSessionInTab starts a PTY-backed session for srv and returns the command
+// that keeps it fed.
+func (m *AppModel) openSessionInTab(srv domain.Server) tea.Cmd {
+	if existing := m.sessions.findByAlias(srv.Alias); existing != nil {
+		m.activeSessionAlias = srv.Alias
+		m.terminalFocused = true
+		return nil
+	}
+	tab, err := newSession(srv, m.sessions.termCols(), m.sessions.termRows())
+	if err != nil {
+		var cmd tea.Cmd
+		m.statusBar, cmd = m.statusBar.Show("Session failed: "+err.Error(), colorErrHex)
+		return cmd
+	}
+	m.sessions.addSession(tab)
+	m.activeSessionAlias = srv.Alias
+	m.terminalFocused = true
+	m.updateListItems()
+	return tea.Batch(waitForPtyOutput(tab), sessionRedraw(srv.Alias))
+}
+
+// sessionTickMsg nudges a redraw while a session is open.
+type sessionTickMsg struct{ Alias string }
+
+// sessionRedraw schedules a repaint so freshly started sessions show their first
+// frame even before the remote sends anything.
+func sessionRedraw(alias string) tea.Cmd {
+	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
+		return sessionTickMsg{Alias: alias}
+	})
+}
+
+// wheelStep is how many lines one wheel notch scrolls.
+const wheelStep = 3
+
+// bodyRows is the terminal height of the full-screen session view.
+func bodyRows(height int) int {
+	if h := height - 2; h > 3 {
+		return h
+	}
+	return 3
+}
+
+// wheelToMouse converts a bubbletea wheel message into the emulator's mouse
+// event so remote programs that enabled mouse reporting receive it.
+//
+// tea.MouseWheelMsg and vt.MouseWheel are both aliases of the same ultraviolet
+// type, so a plain conversion is enough.
+func wheelToMouse(ev tea.MouseWheelMsg) vt.Mouse {
+	m := ev.Mouse()
+	return uv.MouseWheelEvent{
+		X:      m.X,
+		Y:      m.Y,
+		Button: uv.MouseButton(m.Button), // keeps the wheel direction
+		Mod:    uv.KeyMod(m.Mod),
+	}
+}
+
+// handleEmbeddedTerminalMouse handles wheel events and right-click paste over
+// the embedded terminal pane shown next to the server list.
+func (m AppModel) handleEmbeddedTerminalMouse(msg tea.Msg) (bool, tea.Cmd) {
+	if !m.terminalFocused || m.activeSessionAlias == "" {
+		return false, nil
+	}
+	tab := m.sessions.findByAlias(m.activeSessionAlias)
+	if tab == nil || tab.closed {
+		return false, nil
+	}
+
+	switch ev := msg.(type) {
+	case tea.MouseWheelMsg:
+		if tab.altScreen() {
+			tab.sendMouse(wheelToMouse(ev))
+			return true, nil
+		}
+		switch ev.Button {
+		case tea.MouseWheelUp:
+			tab.scrollBy(wheelStep)
+		case tea.MouseWheelDown:
+			tab.scrollBy(-wheelStep)
+		}
+		return true, nil
+
+	case tea.MouseClickMsg:
+		if ev.Button != tea.MouseRight {
+			return false, nil
+		}
+		model, cmd := m.pasteIntoSession(tab)
+		_ = model
+		return true, cmd
+	}
+	return false, nil
+}
+
+// pasteIntoSession copies the system clipboard into a session's PTY.
+func (m AppModel) pasteIntoSession(tab *SessionTab) (tea.Model, tea.Cmd) {
+	text, err := clipboard.ReadAll()
+	if err != nil {
+		var cmd tea.Cmd
+		m.statusBar, cmd = m.statusBar.Show("Cannot read clipboard: "+err.Error(), colorErrHex)
+		return m, cmd
+	}
+	if text == "" {
+		var cmd tea.Cmd
+		m.statusBar, cmd = m.statusBar.Show("Clipboard is empty", colorWarnHex)
+		return m, cmd
+	}
+	tab.scrollToBottom()
+	tab.paste(text)
+	return m, nil
 }

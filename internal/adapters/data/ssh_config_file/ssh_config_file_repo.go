@@ -16,10 +16,11 @@ package ssh_config_file
 
 import (
 	"fmt"
+	"sync/atomic"
 
+	"github.com/kevinburke/ssh_config"
 	"github.com/linpr/lazyssh/internal/core/domain"
 	"github.com/linpr/lazyssh/internal/core/ports"
-	"github.com/kevinburke/ssh_config"
 	"go.uber.org/zap"
 )
 
@@ -29,6 +30,10 @@ type Repository struct {
 	fileSystem      FileSystem
 	metadataManager *metadataManager
 	logger          *zap.SugaredLogger
+
+	// readOnly is set when the config could not be parsed losslessly; writes are
+	// refused so that lazyssh never corrupts a hand-written ~/.ssh/config.
+	readOnly atomic.Bool
 }
 
 // NewRepository creates a new SSH config repository.
@@ -59,7 +64,25 @@ func (r *Repository) ListServers(query string) ([]domain.Server, error) {
 		return nil, fmt.Errorf("failed to load config: %w", err)
 	}
 
-	servers := r.toDomainServer(cfg)
+	// Hosts pulled in through Include are part of the user's real config, so they
+	// belong in the list even though the top-level file never declares them.
+	hosts := r.expandIncludes(cfg.Hosts, 0)
+	servers := make([]domain.Server, 0, len(hosts))
+	seen := make(map[string]bool, len(hosts))
+	for _, host := range hosts {
+		srv, ok := r.hostToServer(host)
+		if !ok {
+			continue
+		}
+		// OpenSSH lets a later block override an earlier one; keep the first
+		// concrete definition so the list has exactly one row per alias.
+		if seen[srv.Alias] {
+			continue
+		}
+		seen[srv.Alias] = true
+		servers = append(servers, srv)
+	}
+
 	metadata, err := r.metadataManager.loadAll()
 	if err != nil {
 		r.logger.Warnf("Failed to load metadata: %v", err)
@@ -84,7 +107,10 @@ func (r *Repository) AddServer(server domain.Server) error {
 		return fmt.Errorf("server with alias '%s' already exists", server.Alias)
 	}
 
-	host := r.createHostFromServer(server)
+	host, err := r.createHostFromServer(server)
+	if err != nil {
+		return err
+	}
 	cfg.Hosts = append(cfg.Hosts, host)
 
 	if err := r.saveConfig(cfg); err != nil {
@@ -113,8 +139,14 @@ func (r *Repository) UpdateServer(server domain.Server, newServer domain.Server)
 
 		newPatterns := make([]*ssh_config.Pattern, 0, len(host.Patterns))
 		for _, pattern := range host.Patterns {
-			if pattern.Str == server.Alias {
-				newPatterns = append(newPatterns, &ssh_config.Pattern{Str: newServer.Alias})
+			if pattern.String() == server.Alias {
+				// ssh_config.Pattern values are immutable upstream (≥1.5), so a
+				// replacement pattern has to be constructed via NewPattern.
+				replacement, err := ssh_config.NewPattern(newServer.Alias)
+				if err != nil {
+					return fmt.Errorf("invalid alias '%s': %w", newServer.Alias, err)
+				}
+				newPatterns = append(newPatterns, replacement)
 			} else {
 				newPatterns = append(newPatterns, pattern)
 			}

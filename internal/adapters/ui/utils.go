@@ -212,11 +212,11 @@ func GetAvailableSSHKeys() []string {
 	}
 
 	skip := map[string]bool{
-		"known_hosts":       true,
-		"known_hosts.old":   true,
-		"authorized_keys":   true,
-		"authorized_keys2":  true,
-		"config":            true,
+		"known_hosts":      true,
+		"known_hosts.old":  true,
+		"authorized_keys":  true,
+		"authorized_keys2": true,
+		"config":           true,
 	}
 
 	var keys []string

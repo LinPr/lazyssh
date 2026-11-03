@@ -1,91 +1,169 @@
 name: Release
 
+# Builds release binaries when a version tag is pushed:
+#
+#   git tag v2.0.0
+#   git push origin v2.0.0
+#
+# Targets: linux/amd64 and windows/amd64.
+# Publishes lazyssh-linux-amd64, lazyssh-windows-amd64.exe and checksums.txt
+# as a GitHub Release.
+
 on:
   push:
     tags:
       - 'v*'
-    branches:
-      - main
+
+# Read-only by default; only the release job is allowed to write.
+permissions:
+  contents: read
+
+# Two tags pushed in quick succession must not race on the same release.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  # Pure-Go static binaries: no libc dependency, runs on any distro.
+  CGO_ENABLED: "0"
+  # Strip local build paths so the binaries are reproducible.
+  GOFLAGS: "-trimpath"
 
 jobs:
-  release:
-    permissions:
-      contents: write
-
+  # Fail fast: never publish a tag that does not build or pass its tests.
+  test:
+    name: Test
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v5
-      with:
-        fetch-depth: 0
+      - name: Checkout
+        uses: actions/checkout@v7
 
-    - name: Set up Go
-      uses: actions/setup-go@v6
-      with:
-        go-version: '1.25.0'
-    - run: go version
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
 
-    - name: Get version
-      id: get_version
-      run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l cmd internal)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
 
-    - name: Build for Linux AMD64
-      run: |
-        GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build \
-          -ldflags "-s -w -X github.com/linpr/lazyssh/cmd.version=${{ steps.get_version.outputs.VERSION }} -X github.com/linpr/lazyssh/cmd.commit=$(git rev-parse --short HEAD)" \
-          -o lazyssh-linux-amd64 ./cmd/
+      - name: Vet
+        run: go vet ./...
 
-    - name: Build for Linux ARM64
-      run: |
-        GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build \
-          -ldflags "-s -w -X github.com/linpr/lazyssh/cmd.version=${{ steps.get_version.outputs.VERSION }} -X github.com/linpr/lazyssh/cmd.commit=$(git rev-parse --short HEAD)" \
-          -o lazyssh-linux-arm64 ./cmd/
+      - name: Test
+        run: go test ./...
 
-    - name: Build for Windows AMD64
-      run: |
-        GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build \
-          -ldflags "-s -w -X github.com/linpr/lazyssh/cmd.version=${{ steps.get_version.outputs.VERSION }} -X github.com/linpr/lazyssh/cmd.commit=$(git rev-parse --short HEAD)" \
-          -o lazyssh-windows-amd64.exe ./cmd/
+      # Cheap insurance against a windows-only compile break: the matrix below
+      # would catch it, but only after the test job has already passed.
+      - name: Cross-compile check
+        run: |
+          GOOS=windows GOARCH=amd64 go build -o /dev/null ./cmd/
 
-    - name: Build for Windows ARM64
-      run: |
-        GOOS=windows GOARCH=arm64 CGO_ENABLED=0 go build \
-          -ldflags "-s -w -X github.com/linpr/lazyssh/cmd.version=${{ steps.get_version.outputs.VERSION }} -X github.com/linpr/lazyssh/cmd.commit=$(git rev-parse --short HEAD)" \
-          -o lazyssh-windows-arm64.exe ./cmd/
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      # Build the other target even if one fails, so both logs are available.
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # Full history so the commit hash is always resolvable.
+          fetch-depth: 0
 
-    - name: Build for macOS AMD64
-      run: |
-        GOOS=darwin GOARCH=amd64 CGO_ENABLED=0 go build \
-          -ldflags "-s -w -X github.com/linpr/lazyssh/cmd.version=${{ steps.get_version.outputs.VERSION }} -X github.com/linpr/lazyssh/cmd.commit=$(git rev-parse --short HEAD)" \
-          -o lazyssh-darwin-amd64 ./cmd/
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
 
-    - name: Build for macOS ARM64
-      run: |
-        GOOS=darwin GOARCH=arm64 CGO_ENABLED=0 go build \
-          -ldflags "-s -w -X github.com/linpr/lazyssh/cmd.version=${{ steps.get_version.outputs.VERSION }} -X github.com/linpr/lazyssh/cmd.commit=$(git rev-parse --short HEAD)" \
-          -o lazyssh-darwin-arm64 ./cmd/
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          commit="$(git rev-parse --short HEAD)"
+          out="lazyssh-${GOOS}-${GOARCH}${EXT}"
 
-    - name: Create checksums
-      run: |
-        sha256sum lazyssh-* > checksums.txt
+          go build \
+            -ldflags "-s -w -X main.version=${version} -X main.commit=${commit}" \
+            -o "${out}" ./cmd/
 
-    - name: Create Release
-      uses: softprops/action-gh-release@v1
-      with:
-        tag_name: ${{ steps.get_version.outputs.VERSION }}
-        name: Release ${{ steps.get_version.outputs.VERSION }}
-        draft: false
-        prerelease: false
-        generate_release_notes: true
-        files: |
-          lazyssh-linux-amd64
-          lazyssh-linux-arm64
-          lazyssh-windows-amd64.exe
-          lazyssh-windows-arm64.exe
-          lazyssh-darwin-amd64
-          lazyssh-darwin-arm64
-          checksums.txt
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "built ${out}: $(stat -c%s "${out}") bytes, version=${version}, commit=${commit}"
+          file "${out}"
+
+      - name: Smoke test
+        # Only the Linux binary can run on this runner; the Windows one is
+        # validated by the build plus the cross-compile check in the test job.
+        if: matrix.goos == 'linux'
+        run: |
+          chmod +x lazyssh-linux-amd64
+          ./lazyssh-linux-amd64 --version
+          ./lazyssh-linux-amd64 --help > /dev/null
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: lazyssh-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: lazyssh-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          if-no-files-found: error
+          # Binaries barely compress; skipping zlib makes the upload much faster.
+          compression-level: 0
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      # Required to create the release and upload its assets.
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksum
+        run: |
+          set -euo pipefail
+          cd dist
+          # Artifacts are zipped on upload, which drops the executable bit.
+          chmod +x lazyssh-linux-amd64 lazyssh-windows-amd64.exe
+          ls -l
+          sha256sum lazyssh-* > checksums.txt
+          cat checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          # Tags like v2.1.0-rc1 become pre-releases.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/lazyssh-linux-amd64
+            dist/lazyssh-windows-amd64.exe
+            dist/checksums.txt

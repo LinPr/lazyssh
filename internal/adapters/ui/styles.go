@@ -193,3 +193,48 @@ var HelpOverlayStyle = lipgloss.NewStyle().
 	Border(lipgloss.RoundedBorder()).
 	BorderForeground(colorAmber).
 	Padding(1, 2)
+
+// SessionBadgeStyle marks a row that has a live embedded session.
+var SessionBadgeStyle = lipgloss.NewStyle().
+	Foreground(colorGreen).
+	Bold(true)
+
+// ForwardBadgeStyle marks a row with an active port-forward process.
+var ForwardBadgeStyle = lipgloss.NewStyle().
+	Foreground(colorCyan).
+	Bold(true)
+
+// PanelSubtleStyle is the dim caption used by secondary panels (keys, forwards,
+// known hosts).
+var PanelSubtleStyle = lipgloss.NewStyle().
+	Foreground(colorDim)
+
+// PanelHighlightStyle renders the focused row of a secondary panel.
+var PanelHighlightStyle = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(colorText).
+	Background(colorSelected)
+
+// PaletteItemStyle renders one command-palette entry.
+var PaletteItemStyle = lipgloss.NewStyle().
+	Foreground(colorText)
+
+// PaletteSelectedStyle renders the highlighted command-palette entry.
+//
+// It must not add horizontal padding: the highlight is drawn inline, so any
+// extra column would make the selected row wider than the box and wrap it.
+var PaletteSelectedStyle = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(colorBg).
+	Background(colorAccent)
+
+// PanelTitleStyle renders the heading of a secondary panel overlay.
+var PanelTitleStyle = lipgloss.NewStyle().
+	Bold(true).
+	Foreground(colorAccent)
+
+// PanelBorderStyle wraps a secondary panel overlay.
+var PanelBorderStyle = lipgloss.NewStyle().
+	Border(lipgloss.RoundedBorder()).
+	BorderForeground(colorAmber).
+	Padding(1, 2)

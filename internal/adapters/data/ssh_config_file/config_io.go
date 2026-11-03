@@ -17,10 +17,10 @@ package ssh_config_file
 import (
 	"bufio"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/kevinburke/ssh_config"
 )
@@ -41,16 +41,76 @@ func (r *Repository) loadConfig() (*ssh_config.Config, error) {
 		}
 	}()
 
-	cfg, err := ssh_config.Decode(file)
+	raw, err := io.ReadAll(file)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode config: %w", err)
+		return nil, fmt.Errorf("failed to read config file: %w", err)
+	}
+
+	cfg, err := ssh_config.DecodeBytes(raw)
+	if err != nil {
+		// Upstream ssh_config (≥1.5) rejects Match criteria it does not implement
+		// (Match user/localuser/originalhost/canonical/final and Match exec), while
+		// the previous fork silently flattened those blocks into the enclosing Host.
+		// Parse a sanitized copy so the list stays usable, but remember that the
+		// file cannot be round-tripped faithfully and refuse to write it back.
+		sanitized, changed := sanitizeUnsupportedMatch(raw)
+		if !changed {
+			return nil, fmt.Errorf("failed to decode config: %w", err)
+		}
+		cfg, decodeErr := ssh_config.DecodeBytes(sanitized)
+		if decodeErr != nil {
+			return nil, fmt.Errorf("failed to decode config: %w", err)
+		}
+		r.readOnly.Store(true)
+		r.logger.Warnw("ssh config contains Match directives the parser cannot represent; "+
+			"lazyssh is running in read-only mode to avoid corrupting the file",
+			"path", r.configPath,
+			"match_error", err,
+		)
+		return cfg, nil
 	}
 
 	return cfg, nil
 }
 
+// sanitizeUnsupportedMatch rewrites Match directives that upstream ssh_config
+// refuses to parse into an inert `Host !*` line, keeping the original text in a
+// trailing comment so the block remains visible in the UI. Supported criteria
+// (Match host / Match all) are left untouched. The second return value reports
+// whether anything was rewritten.
+func sanitizeUnsupportedMatch(raw []byte) ([]byte, bool) {
+	lines := strings.Split(string(raw), "\n")
+	changed := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 2 || !strings.EqualFold(fields[0], "Match") {
+			continue
+		}
+		switch strings.ToLower(fields[1]) {
+		case "host", "all":
+			// Parsed natively by upstream.
+		default:
+			lines[i] = "Host !*  # lazyssh: unsupported Match directive kept as-is: " + trimmed
+			changed = true
+		}
+	}
+	if !changed {
+		return raw, false
+	}
+	return []byte(strings.Join(lines, "\n")), true
+}
+
 // saveConfig writes the SSH config back to the file with atomic operations and backup management.
 func (r *Repository) saveConfig(cfg *ssh_config.Config) error {
+	if r.readOnly.Load() {
+		return fmt.Errorf("ssh config left untouched: it contains Match directives that cannot be " +
+			"round-tripped, edit the file manually")
+	}
+
 	configDir := filepath.Dir(r.configPath)
 
 	tempFile, err := r.createTempFile(configDir)
@@ -111,26 +171,81 @@ func (r *Repository) writeConfigToFile(filePath string, cfg *ssh_config.Config) 
 
 // createTempFile creates a temporary file in the specified directory
 func (r *Repository) createTempFile(dir string) (string, error) {
-	timestamp := time.Now().Format("20060102150405")
-	tempFileName := fmt.Sprintf("config%s%s", timestamp, TempSuffix)
-	tempFilePath := filepath.Join(dir, tempFileName)
-
-	// Create the temp file with explicit 0600 permissions
-	f, err := r.fileSystem.OpenFile(tempFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, SSHConfigPerms)
+	// os.CreateTemp gives a collision-free name and 0600 permissions; the previous
+	// second-resolution timestamp could silently reuse the same temp file when two
+	// writes happened within one second.
+	f, err := os.CreateTemp(dir, "config-*.tmp")
 	if err != nil {
 		return "", err
 	}
+	name := f.Name()
 	if cerr := f.Close(); cerr != nil {
-		r.logger.Warnf("failed to close temporary file %s: %v", tempFilePath, cerr)
+		r.logger.Warnf("failed to close temporary file %s: %v", name, cerr)
 	}
 
-	return tempFilePath, nil
+	return name, nil
 }
 
-// GetRawConfigBlock reads the config file and returns the raw text block for the given alias.
-// It includes the "Host <alias>" line itself and all lines until the next "Host " or "Match " line or EOF.
+// GetRawConfigBlock reads the config file and returns the raw text block for the
+// given alias, including the "Host <alias>" line and everything up to the next
+// Host/Match header.
+//
+// Included files are searched too: a host declared in ~/.ssh/config.d/* has no
+// block in the main file, and the previous implementation reported "(config
+// block not found)" for it.
 func (r *Repository) GetRawConfigBlock(alias string) (string, error) {
-	file, err := r.fileSystem.Open(r.configPath)
+	block, err := r.rawBlockIn(r.configPath, alias)
+	if err != nil || block != "" {
+		return block, err
+	}
+	// Fall back to Include targets (depth-limited to match expandIncludes).
+	for _, path := range r.includeFiles(0) {
+		block, err := r.rawBlockIn(path, alias)
+		if err != nil {
+			r.logger.Warnw("failed to read included config", "path", path, "error", err)
+			continue
+		}
+		if block != "" {
+			return block, nil
+		}
+	}
+	return "", nil
+}
+
+// includeFiles lists every file reachable through Include directives.
+func (r *Repository) includeFiles(depth int) []string {
+	if depth > maxIncludeDepth {
+		return nil
+	}
+	cfg, err := r.loadConfig()
+	if err != nil {
+		return nil
+	}
+	var files []string
+	seen := make(map[string]bool)
+	for _, host := range cfg.Hosts {
+		for _, node := range host.Nodes {
+			inc, ok := node.(*ssh_config.Include)
+			if !ok {
+				continue
+			}
+			for _, pattern := range includePatterns(inc.String()) {
+				for _, path := range r.globInclude(pattern) {
+					if seen[path] {
+						continue
+					}
+					seen[path] = true
+					files = append(files, path)
+				}
+			}
+		}
+	}
+	return files
+}
+
+// rawBlockIn scans one file for the Host block belonging to alias.
+func (r *Repository) rawBlockIn(path, alias string) (string, error) {
+	file, err := r.fileSystem.Open(path)
 	if err != nil {
 		if r.fileSystem.IsNotExist(err) {
 			return "", nil
@@ -151,17 +266,19 @@ func (r *Repository) GetRawConfigBlock(alias string) (string, error) {
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
 
-		// Detect a new block header
 		if strings.HasPrefix(trimmed, "Host ") || strings.HasPrefix(trimmed, "Match ") {
 			if inBlock {
-				// Reached the next block; stop collecting
 				break
 			}
-			// Check if this is the block for the requested alias
 			parts := strings.Fields(trimmed)
-			if strings.HasPrefix(trimmed, "Host ") && len(parts) >= 2 && parts[1] == alias {
-				inBlock = true
-				lines = append(lines, line)
+			if strings.HasPrefix(trimmed, "Host ") && len(parts) >= 2 {
+				for _, candidate := range parts[1:] {
+					if candidate == alias {
+						inBlock = true
+						lines = append(lines, line)
+						break
+					}
+				}
 			}
 			continue
 		}
@@ -175,5 +292,9 @@ func (r *Repository) GetRawConfigBlock(alias string) (string, error) {
 		return "", fmt.Errorf("failed to read config file: %w", err)
 	}
 
+	// Trim trailing blank lines so the details pane does not show dead space.
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
 	return strings.Join(lines, "\n"), nil
 }

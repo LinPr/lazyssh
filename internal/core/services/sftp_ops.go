@@ -21,9 +21,9 @@ import (
 	"os/exec"
 	"sort"
 
-	"github.com/pkg/sftp"
 	"github.com/linpr/lazyssh/internal/core/domain"
 	"github.com/linpr/lazyssh/internal/core/ports"
+	"github.com/pkg/sftp"
 )
 
 // openSFTP starts the sftp subsystem over the existing ControlMaster socket and
@@ -297,4 +297,33 @@ func (s *serverService) DownloadFile(alias, remotePath, localPath string, progre
 		progress <- ports.TransferProgress{Percent: 100, Bytes: total, Total: total, Done: true}
 	}
 	return nil
+}
+
+// ChmodRemote changes the permission bits of a remote path.
+func (s *serverService) ChmodRemote(alias, path string, mode uint32) error {
+	client, cleanup, err := openSFTP(alias)
+	if err != nil {
+		return fmt.Errorf("chmod remote failed: %w", err)
+	}
+	defer cleanup()
+	if err := client.Chmod(path, os.FileMode(mode)); err != nil {
+		return fmt.Errorf("chmod remote failed: %w", err)
+	}
+	return nil
+}
+
+// HomeDirRemote resolves the login user's home directory, used as the initial
+// location of the remote pane (previously it started at ".", which is whatever
+// directory sshd happened to pick).
+func (s *serverService) HomeDirRemote(alias string) (string, error) {
+	client, cleanup, err := openSFTP(alias)
+	if err != nil {
+		return "", fmt.Errorf("home dir failed: %w", err)
+	}
+	defer cleanup()
+	wd, err := client.Getwd()
+	if err != nil {
+		return "", fmt.Errorf("home dir failed: %w", err)
+	}
+	return wd, nil
 }

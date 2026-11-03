@@ -24,6 +24,10 @@ import (
 
 // New constructs a Sugared Logger that writes to a file and
 // provides human-readable timestamps.
+//
+// Logging is best-effort: a read-only or missing HOME must never stop the TUI
+// from starting, so the function falls back to a temp-dir log and finally to a
+// no-op logger instead of returning an error.
 func New(service string, outputPaths ...string) (*zap.SugaredLogger, error) {
 	config := zap.NewProductionConfig()
 
@@ -35,18 +39,12 @@ func New(service string, outputPaths ...string) (*zap.SugaredLogger, error) {
 		"service": service,
 	}
 
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, err
-	}
-	logDir := filepath.Join(home, ".lazyssh")
-	if err := os.MkdirAll(logDir, 0o750); err != nil {
-		return nil, err
-	}
-	config.OutputPaths = []string{filepath.Join(logDir, "lazyssh.log")}
-
-	if outputPaths != nil {
+	if len(outputPaths) > 0 {
 		config.OutputPaths = outputPaths
+	} else if path := defaultLogPath(); path != "" {
+		config.OutputPaths = []string{path}
+	} else {
+		return zap.NewNop().Sugar(), nil
 	}
 
 	log, err := config.Build(zap.WithCaller(true))
@@ -55,4 +53,53 @@ func New(service string, outputPaths ...string) (*zap.SugaredLogger, error) {
 	}
 
 	return log.Sugar(), nil
+}
+
+// defaultLogPath picks a writable log file, or "" when none is available.
+func defaultLogPath() string {
+	candidates := make([]string, 0, 2)
+	if home, err := os.UserHomeDir(); err == nil {
+		candidates = append(candidates, filepath.Join(home, ".lazyssh"))
+	}
+	candidates = append(candidates, filepath.Join(os.TempDir(), "lazyssh-"+itoa(os.Getuid())))
+
+	for _, dir := range candidates {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			continue
+		}
+		// Probe writability: MkdirAll succeeds on an existing read-only dir.
+		probe, err := os.CreateTemp(dir, ".probe-*")
+		if err != nil {
+			continue
+		}
+		name := probe.Name()
+		_ = probe.Close()
+		_ = os.Remove(name)
+		return filepath.Join(dir, "lazyssh.log")
+	}
+	return ""
+}
+
+// itoa is a tiny int-to-string helper that avoids pulling strconv into the hot
+// import list for one call.
+func itoa(v int) string {
+	if v == 0 {
+		return "0"
+	}
+	neg := v < 0
+	if neg {
+		v = -v
+	}
+	var buf [20]byte
+	i := len(buf)
+	for v > 0 {
+		i--
+		buf[i] = byte('0' + v%10)
+		v /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
 }

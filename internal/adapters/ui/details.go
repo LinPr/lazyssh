@@ -17,17 +17,17 @@ package ui
 import (
 	"strings"
 
-	"github.com/charmbracelet/x/ansi"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // DetailsModel displays the raw SSH config block for the selected server.
 // It renders directly without a viewport component to avoid word-wrap issues.
 type DetailsModel struct {
-	rawContent string // original unprocessed SSH config block
+	rawContent string   // original unprocessed SSH config block
 	lines      []string // highlighted + truncated lines, rebuilt on each SetSize/SetRawConfig
-	offset     int  // scroll offset
+	offset     int      // scroll offset
 	width      int
 	height     int
 }
@@ -113,22 +113,50 @@ func (m *DetailsModel) rebuildLines() {
 
 func (m DetailsModel) Init() tea.Cmd { return nil }
 
+// Update handles scrolling of the config block.
+//
+// The previous version was never called from the app, so long config blocks
+// could not be read past the first screenful. It is now driven by the list
+// state whenever the left pane has focus.
 func (m DetailsModel) Update(msg tea.Msg) (DetailsModel, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyPressMsg:
-		ch := m.contentH()
-		switch msg.String() {
-		case "down", "j":
-			if m.offset < len(m.lines)-ch {
-				m.offset++
-			}
-		case "up", "k":
-			if m.offset > 0 {
-				m.offset--
-			}
+	kp, ok := msg.(tea.KeyPressMsg)
+	if !ok {
+		return m, nil
+	}
+	maxOffset := len(m.lines) - m.contentH()
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	switch kp.String() {
+	case "down", "j":
+		if m.offset < maxOffset {
+			m.offset++
 		}
+	case "up", "k":
+		if m.offset > 0 {
+			m.offset--
+		}
+	case "pgdown", "ctrl+f":
+		m.offset += m.contentH()
+		if m.offset > maxOffset {
+			m.offset = maxOffset
+		}
+	case "pgup", "ctrl+b":
+		m.offset -= m.contentH()
+		if m.offset < 0 {
+			m.offset = 0
+		}
+	case "g", "home":
+		m.offset = 0
+	case "G", "end":
+		m.offset = maxOffset
 	}
 	return m, nil
+}
+
+// scrollable reports whether the current block overflows the pane.
+func (m DetailsModel) scrollable() bool {
+	return len(m.lines) > m.contentH()
 }
 
 func (m DetailsModel) View() tea.View {

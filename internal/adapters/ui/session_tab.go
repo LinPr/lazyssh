@@ -18,10 +18,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 
-	"github.com/creack/pty"
-	"github.com/hinshun/vt10x"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/vt"
+	"github.com/creack/pty"
 	"github.com/linpr/lazyssh/internal/core/domain"
 )
 
@@ -31,18 +32,27 @@ type PtyOutputMsg struct{ Alias string }
 // SessionClosedMsg is sent when an SSH session process exits.
 type SessionClosedMsg struct{ Alias string }
 
-// sessionListWidth is the fixed column width of the left sessions panel.
-const sessionListWidth = 22
+// scrollbackLines is how much history each session keeps for wheel/PgUp
+// scrolling. 5000 lines is roughly a screen-and-a-half per 30-row terminal ×160.
+const scrollbackLines = 5000
 
-// SessionTab holds one active SSH session: its PTY master, vt10x terminal
-// emulator state, and the channel used to notify the TUI of new output.
+// SessionTab holds one active SSH session: its PTY master, terminal emulator
+// state, and the channel used to notify the TUI of new output.
 type SessionTab struct {
 	server domain.Server
 	cmd    *exec.Cmd
 	ptm    *os.File
-	term   vt10x.Terminal
+	term   *vt.Emulator
 	outCh  chan struct{}
 	closed bool
+
+	// mu guards term: the reader goroutine writes to it while the render loop
+	// reads cells out of it. *vt.Emulator is not internally synchronised.
+	mu sync.Mutex
+
+	// scrollOffset counts lines scrolled back from the live view: 0 is the
+	// bottom, positive values look further into history.
+	scrollOffset int
 }
 
 // SessionsModel is the connection pool of active SSH sessions.
@@ -53,7 +63,7 @@ type SessionsModel struct {
 	height int
 }
 
-// newSession starts "ssh <alias>" inside a PTY, wires it to a vt10x terminal
+// newSession starts "ssh <alias>" inside a PTY, wires it to a terminal emulator
 // emulator, and launches the goroutine that feeds PTY bytes into the emulator.
 func newSession(server domain.Server, cols, rows int) (*SessionTab, error) {
 	// #nosec G204
@@ -72,8 +82,9 @@ func newSession(server domain.Server, cols, rows int) (*SessionTab, error) {
 		return nil, fmt.Errorf("pty setsize: %w", err)
 	}
 
-	// WithWriter routes OSC/DA responses from the terminal emulator back to ssh.
-	term := vt10x.New(vt10x.WithSize(cols, rows), vt10x.WithWriter(ptm))
+	term := vt.NewEmulator(cols, rows)
+	// Keep history so the wheel can scroll back through it.
+	term.SetScrollbackSize(scrollbackLines)
 
 	tab := &SessionTab{
 		server: server,
@@ -83,10 +94,27 @@ func newSession(server domain.Server, cols, rows int) (*SessionTab, error) {
 		outCh:  make(chan struct{}, 1),
 	}
 	go tab.readLoop()
+	// Terminal replies (device attributes, mode reports, OSC answers) are written
+	// to the emulator's input pipe; forward them to ssh or it hangs waiting.
+	go tab.responseLoop()
 	return tab, nil
 }
 
-// readLoop drains the PTY master, feeds bytes into the vt10x emulator, and
+// responseLoop forwards the emulator's replies back to the child process.
+func (t *SessionTab) responseLoop() {
+	buf := make([]byte, 1024)
+	for {
+		n, err := t.term.Read(buf)
+		if n > 0 {
+			_, _ = t.ptm.Write(buf[:n])
+		}
+		if err != nil {
+			return
+		}
+	}
+}
+
+// readLoop drains the PTY master, feeds bytes into the terminal emulator, and
 // signals outCh on every non-empty read. Closes outCh on EOF.
 func (t *SessionTab) readLoop() {
 	defer func() {
@@ -94,12 +122,21 @@ func (t *SessionTab) readLoop() {
 		close(t.outCh)
 	}()
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, 32*1024)
 	for {
 		n, err := t.ptm.Read(buf)
 		if n > 0 {
-			// Write() acquires its own internal lock — do NOT call t.term.Lock() here.
+			t.mu.Lock()
 			_, _ = t.term.Write(buf[:n])
+			// New output while scrolled back must not move the viewport, but the
+			// offset has to stay inside the (possibly larger) history buffer.
+			if t.scrollOffset > 0 {
+				if avail := t.term.ScrollbackLen(); t.scrollOffset > avail {
+					t.scrollOffset = avail
+				}
+			}
+			t.mu.Unlock()
+
 			select {
 			case t.outCh <- struct{}{}:
 			default:
@@ -116,13 +153,84 @@ func (t *SessionTab) writeInput(data []byte) {
 	_, _ = t.ptm.Write(data)
 }
 
+// pasteTypes text into the session. Bracketed paste is used when the remote
+// shell enabled it, so multi-line pastes are not executed line by line.
+func (t *SessionTab) paste(text string) {
+	if text == "" {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.term.Paste(text)
+}
+
+// scrollBy moves the viewport by delta lines (negative = older).
+// It returns true when the offset changed.
+func (t *SessionTab) scrollBy(delta int) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	maxOffset := t.term.ScrollbackLen()
+	next := t.scrollOffset + delta
+	if next < 0 {
+		next = 0
+	}
+	if next > maxOffset {
+		next = maxOffset
+	}
+	if next == t.scrollOffset {
+		return false
+	}
+	t.scrollOffset = next
+	return true
+}
+
+// scrollToBottom returns the viewport to the live output.
+func (t *SessionTab) scrollToBottom() {
+	t.mu.Lock()
+	t.scrollOffset = 0
+	t.mu.Unlock()
+}
+
+// isScrolledBack reports whether the viewport is showing history.
+func (t *SessionTab) isScrolledBack() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.scrollOffset > 0
+}
+
+// scrolledLines reports how many lines of history the viewport is showing.
+func (t *SessionTab) scrolledLines() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.scrollOffset
+}
+
+// altScreen reports whether the remote program took over the alternate screen
+// (vim, less, htop…). In that mode the wheel belongs to the remote program.
+func (t *SessionTab) altScreen() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.term.IsAltScreen()
+}
+
+// sendMouse forwards a mouse event to the remote program, which only has an
+// effect when it enabled mouse reporting itself.
+func (t *SessionTab) sendMouse(m vt.Mouse) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.term.SendMouse(m)
+}
+
 // resize updates both the OS PTY and the terminal emulator dimensions.
 func (t *SessionTab) resize(cols, rows int) {
 	_ = pty.Setsize(t.ptm, &pty.Winsize{
 		Rows: uint16(rows),
 		Cols: uint16(cols),
 	})
+	t.mu.Lock()
 	t.term.Resize(cols, rows)
+	t.mu.Unlock()
 }
 
 // close terminates the SSH process and the PTY file descriptor.
@@ -131,6 +239,7 @@ func (t *SessionTab) close() {
 		_ = t.cmd.Process.Kill()
 	}
 	_ = t.ptm.Close()
+	_ = t.term.Close()
 }
 
 // waitForPtyOutput returns a Cmd that blocks until the session produces new

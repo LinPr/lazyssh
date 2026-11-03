@@ -64,20 +64,21 @@ type filePanelModel struct {
 // ---- FileBrowserModel ----
 
 type FileBrowserModel struct {
-	server      domain.Server
-	service     ports.ServerService
-	local       filePanelModel
-	remote      filePanelModel
-	activePanel int // 0=local, 1=remote
-	inputMode   int // 0=none, 1=mkdir, 2=rename, 3=delete-confirm
-	inputValue  string
-	transfer    *ports.TransferProgress
-	transferDir int // 1=upload, 2=download
-	progressCh  chan ports.TransferProgress // active transfer channel for re-queuing
-	showHelp    bool
-	help        HelpModel
-	width       int
-	height      int
+	server       domain.Server
+	service      ports.ServerService
+	local        filePanelModel
+	remote       filePanelModel
+	activePanel  int // 0=local, 1=remote
+	inputMode    int // 0=none, 1=mkdir, 2=rename, 3=delete-confirm
+	inputValue   string
+	deleteTarget string
+	transfer     *ports.TransferProgress
+	transferDir  int                         // 1=upload, 2=download
+	progressCh   chan ports.TransferProgress // active transfer channel for re-queuing
+	showHelp     bool
+	help         HelpModel
+	width        int
+	height       int
 }
 
 // NewFileBrowserModel creates and initialises a FileBrowserModel.
@@ -221,6 +222,10 @@ func (m FileBrowserModel) handleBrowserKey(msg tea.KeyPressMsg, cmds *[]tea.Cmd)
 			entry := panel.entries[panel.cursor]
 			if entry.IsDir {
 				newPath := filepath.Join(panel.path, entry.Name)
+				if m.activePanel == 1 {
+					// Remote paths are POSIX even on a Windows client.
+					newPath = remoteJoin(panel.path, entry.Name)
+				}
 				if m.activePanel == 0 {
 					m.local.loading = true
 					*cmds = append(*cmds, loadLocalFiles(newPath))
@@ -233,6 +238,9 @@ func (m FileBrowserModel) handleBrowserKey(msg tea.KeyPressMsg, cmds *[]tea.Cmd)
 
 	case "backspace", "h":
 		parent := filepath.Dir(panel.path)
+		if m.activePanel == 1 {
+			parent = remoteDir(panel.path)
+		}
 		if parent != panel.path {
 			if m.activePanel == 0 {
 				m.local.loading = true
@@ -248,7 +256,7 @@ func (m FileBrowserModel) handleBrowserKey(msg tea.KeyPressMsg, cmds *[]tea.Cmd)
 		if m.activePanel == 0 && len(m.local.entries) > 0 {
 			entry := m.local.entries[m.local.cursor]
 			localPath := filepath.Join(m.local.path, entry.Name)
-			remotePath := m.remote.path + "/" + entry.Name
+			remotePath := remoteJoin(m.remote.path, entry.Name)
 			progressCh := make(chan ports.TransferProgress, 64)
 			m.progressCh = progressCh
 			m.transferDir = 1
@@ -264,7 +272,7 @@ func (m FileBrowserModel) handleBrowserKey(msg tea.KeyPressMsg, cmds *[]tea.Cmd)
 		// Download: remote -> local
 		if m.activePanel == 1 && len(m.remote.entries) > 0 {
 			entry := m.remote.entries[m.remote.cursor]
-			remotePath := m.remote.path + "/" + entry.Name
+			remotePath := remoteJoin(m.remote.path, entry.Name)
 			localPath := filepath.Join(m.local.path, entry.Name)
 			progressCh := make(chan ports.TransferProgress, 64)
 			m.progressCh = progressCh
@@ -284,7 +292,10 @@ func (m FileBrowserModel) handleBrowserKey(msg tea.KeyPressMsg, cmds *[]tea.Cmd)
 	case "x":
 		if len(panel.entries) > 0 {
 			m.inputMode = 3
-			m.inputValue = panel.entries[panel.cursor].Name
+			// Leave the buffer empty: the user has to type "y", so pre-filling it
+			// with the file name made the confirmation impossible to pass.
+			m.inputValue = ""
+			m.deleteTarget = panel.entries[panel.cursor].Name
 		}
 
 	case "r":
@@ -346,7 +357,7 @@ func (m FileBrowserModel) handleInputKey(msg tea.KeyPressMsg, cmds *[]tea.Cmd) (
 		case 1: // mkdir
 			name := strings.TrimSpace(m.inputValue)
 			if name != "" {
-				newPath := panel.path + "/" + name
+				newPath := remoteJoin(panel.path, name)
 				if m.activePanel == 0 {
 					if err := os.MkdirAll(newPath, 0750); err == nil {
 						*cmds = append(*cmds, loadLocalFiles(panel.path))
@@ -356,7 +367,7 @@ func (m FileBrowserModel) handleInputKey(msg tea.KeyPressMsg, cmds *[]tea.Cmd) (
 					svc := m.service
 					p := panel.path
 					*cmds = append(*cmds, func() tea.Msg {
-						err := svc.MkdirRemote(alias, p+"/"+name)
+						err := svc.MkdirRemote(alias, remoteJoin(p, name))
 						entries, listErr := svc.ListRemoteFiles(alias, p)
 						if listErr != nil {
 							return RemoteFilesLoadedMsg{Path: p, Err: listErr}
@@ -384,7 +395,7 @@ func (m FileBrowserModel) handleInputKey(msg tea.KeyPressMsg, cmds *[]tea.Cmd) (
 					svc := m.service
 					p := panel.path
 					*cmds = append(*cmds, func() tea.Msg {
-						_ = svc.RenameRemote(alias, p+"/"+oldName, p+"/"+newName)
+						_ = svc.RenameRemote(alias, remoteJoin(p, oldName), remoteJoin(p, newName))
 						entries, err := svc.ListRemoteFiles(alias, p)
 						return RemoteFilesLoadedMsg{Path: p, Entries: entries, Err: err}
 					})
@@ -395,7 +406,9 @@ func (m FileBrowserModel) handleInputKey(msg tea.KeyPressMsg, cmds *[]tea.Cmd) (
 
 		case 3: // delete confirm
 			if strings.ToLower(m.inputValue) == "y" && len(panel.entries) > 0 {
-				target := panel.entries[panel.cursor].Name
+				// Use the recorded target: the cursor could have moved between
+				// prompting and confirming.
+				target := m.deleteTarget
 				if m.activePanel == 0 {
 					targetPath := filepath.Join(panel.path, target)
 					_ = os.RemoveAll(targetPath)
@@ -405,7 +418,7 @@ func (m FileBrowserModel) handleInputKey(msg tea.KeyPressMsg, cmds *[]tea.Cmd) (
 					svc := m.service
 					p := panel.path
 					*cmds = append(*cmds, func() tea.Msg {
-						_ = svc.DeleteRemote(alias, p+"/"+target)
+						_ = svc.DeleteRemote(alias, remoteJoin(p, target))
 						entries, err := svc.ListRemoteFiles(alias, p)
 						return RemoteFilesLoadedMsg{Path: p, Entries: entries, Err: err}
 					})
@@ -413,6 +426,7 @@ func (m FileBrowserModel) handleInputKey(msg tea.KeyPressMsg, cmds *[]tea.Cmd) (
 			}
 			m.inputMode = 0
 			m.inputValue = ""
+			m.deleteTarget = ""
 
 		default:
 			m.inputMode = 0
@@ -464,7 +478,7 @@ func (m FileBrowserModel) renderPanel(p filePanelModel, active bool, w, h int) s
 	}
 	bStyle := lipgloss.NewStyle().Foreground(borderColor)
 
-	inner := w - 2 // visible cols inside left+right border chars
+	inner := w - 2    // visible cols inside left+right border chars
 	rowW := inner - 2 // visible cols available for row text (minus 1-col padding each side)
 	if rowW < 10 {
 		rowW = 10
@@ -477,9 +491,9 @@ func (m FileBrowserModel) renderPanel(p filePanelModel, active bool, w, h int) s
 	sb.WriteString("\n")
 
 	// Title row
-	titleIcon := " " // nf-fa-laptop for LOCAL
+	titleIcon := "▤ " // portable glyph
 	if p.title == "REMOTE" {
-		titleIcon = " " // nf-fa-server
+		titleIcon = "☁ " // portable glyph
 	}
 	titleText := ansi.Truncate(titleIcon+p.title+": "+p.path, rowW, "…")
 	titlePad := rowW - ansi.StringWidth(titleText)
@@ -566,16 +580,15 @@ func formatFileRow(e domain.FileEntry, width int) string {
 	var nameStyle lipgloss.Style
 	switch {
 	case e.IsDir:
-		icon = " " // nf-fa-folder U+F07B
+		icon = "▸ " // portable glyph
 		nameStyle = lipgloss.NewStyle().Foreground(colorAccent).Bold(true)
 	case isSymlink:
-		icon = " " // nf-fa-link U+F0C1
+		icon = "→ " // portable glyph
 		nameStyle = lipgloss.NewStyle().Foreground(colorCyan)
 	case isExec:
-		icon = " " // nf-oct-terminal U+F489
 		nameStyle = lipgloss.NewStyle().Foreground(colorGreen)
 	default:
-		icon = " " // nf-fa-file U+F016
+		icon = "  " // portable glyph
 		nameStyle = lipgloss.NewStyle().Foreground(colorText)
 	}
 
@@ -638,20 +651,38 @@ func humanFileSize(n int64) string {
 
 // renderStatus renders the progress bar or a blank status row.
 func (m FileBrowserModel) renderStatus() string {
+	// The prompt has to be visible: without it "n"/"r"/"x" looked like no-ops
+	// because the typed text was captured but never drawn anywhere.
+	if m.inputMode != 0 {
+		var label string
+		switch m.inputMode {
+		case 1:
+			label = "New directory name"
+		case 2:
+			label = "Rename to"
+		case 3:
+			label = "Delete " + m.deleteTarget + "? type y to confirm"
+			return StatusErrorStyle.Render("  " + label + "  (Enter/Esc)")
+		}
+		return KeyStyle.Render("  "+label+": ") +
+			m.inputValue + KeyStyle.Render("▏") +
+			HelpStyle.Render("   Enter: confirm   Esc: cancel")
+	}
+
 	if m.transfer == nil {
 		return HelpStyle.Render(" ")
 	}
 	p := m.transfer
 	if p.Err != nil {
-		return StatusErrorStyle.Render("  Transfer error: " + p.Err.Error()) // nf-fa-times U+F00D
+		return StatusErrorStyle.Render("✗  Transfer error: " + p.Err.Error()) // portable glyph
 	}
 	if p.Done {
-		return lipgloss.NewStyle().Foreground(colorGreen).Render("  Transfer complete.") // nf-fa-check U+F00C
+		return lipgloss.NewStyle().Foreground(colorGreen).Render("✓  Transfer complete.") // portable glyph
 	}
 
-	dirIcon := " " // nf-fa-upload U+F093
+	dirIcon := "↑ " // portable glyph
 	if m.transferDir == 2 {
-		dirIcon = " " // nf-fa-download U+F019
+		dirIcon = "↓ " // portable glyph
 	}
 
 	total := 20
@@ -730,4 +761,28 @@ func waitForProgress(ch <-chan ports.TransferProgress) tea.Cmd {
 		}
 		return TransferProgressMsg{Progress: p}
 	}
+}
+
+// remoteJoin joins remote (POSIX) path elements.
+//
+// The remote pane previously used plain string concatenation, so "/" became
+// "//", and filepath.Join would use backslashes on a Windows client.
+func remoteJoin(base, name string) string {
+	base = strings.TrimRight(base, "/")
+	if base == "" {
+		return "/" + name
+	}
+	return base + "/" + name
+}
+
+// remoteDir returns the parent of a remote POSIX path.
+func remoteDir(path string) string {
+	p := strings.TrimRight(path, "/")
+	if p == "" {
+		return "/"
+	}
+	if i := strings.LastIndex(p, "/"); i > 0 {
+		return p[:i]
+	}
+	return "/"
 }

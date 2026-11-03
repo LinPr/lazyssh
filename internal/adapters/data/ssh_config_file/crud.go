@@ -18,8 +18,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/linpr/lazyssh/internal/core/domain"
 	"github.com/kevinburke/ssh_config"
+	"github.com/linpr/lazyssh/internal/core/domain"
 )
 
 const (
@@ -28,42 +28,88 @@ const (
 	BackupSuffix       = "lazyssh.backup"
 	SSHConfigPerms     = 0o600
 	OriginalBackupName = "config.original.backup"
+
+	// kvIndent is the indentation applied to key/value lines that lazyssh
+	// creates itself. Parsed lines keep whatever indentation they had.
+	kvIndent = "    "
 )
 
-// filterServers filters servers based on the query string.
+// filterServers filters servers against a query that may mix plain terms and
+// "#tag" filters, e.g. "prod #web". All terms must match (AND semantics) and
+// matching is case-insensitive across alias, host, user and tags.
+//
+// The tag syntax previously only worked in one UI code path while the repository
+// used a different rule, so the same query could return different rows depending
+// on how it reached the backend.
 func (r *Repository) filterServers(servers []domain.Server, query string) []domain.Server {
-	query = strings.ToLower(query)
-	filtered := make([]domain.Server, 0)
-
-	for _, server := range servers {
-		if r.matchesQuery(server, query) {
-			filtered = append(filtered, server)
-		}
+	terms, tags := splitQuery(query)
+	if len(terms) == 0 && len(tags) == 0 {
+		return servers
 	}
 
+	filtered := make([]domain.Server, 0, len(servers))
+	for _, server := range servers {
+		if !matchesTags(server, tags) {
+			continue
+		}
+		if !matchesTerms(server, terms) {
+			continue
+		}
+		filtered = append(filtered, server)
+	}
 	return filtered
 }
 
-// matchesQuery checks if any field of the server matches the query string.
-func (r *Repository) matchesQuery(server domain.Server, query string) bool {
-	fields := []string{
-		strings.ToLower(server.Host),
-		strings.ToLower(server.User),
+// splitQuery separates "#tag" tokens from free-text terms.
+func splitQuery(query string) (terms, tags []string) {
+	for _, tok := range strings.Fields(strings.ToLower(query)) {
+		if strings.HasPrefix(tok, "#") {
+			if tag := strings.TrimPrefix(tok, "#"); tag != "" {
+				tags = append(tags, tag)
+			}
+			continue
+		}
+		terms = append(terms, tok)
 	}
-	for _, tag := range server.Tags {
-		fields = append(fields, strings.ToLower(tag))
-	}
-	for _, alias := range server.Aliases {
-		fields = append(fields, strings.ToLower(alias))
-	}
+	return terms, tags
+}
 
-	for _, field := range fields {
-		if strings.Contains(field, query) {
-			return true
+// matchesTags reports whether the server carries every requested tag.
+func matchesTags(server domain.Server, tags []string) bool {
+	for _, want := range tags {
+		found := false
+		for _, have := range server.Tags {
+			if strings.EqualFold(have, want) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
 		}
 	}
+	return true
+}
 
-	return false
+// matchesTerms reports whether every free-text term appears in a searchable field.
+func matchesTerms(server domain.Server, terms []string) bool {
+	if len(terms) == 0 {
+		return true
+	}
+	haystack := strings.ToLower(strings.Join([]string{
+		server.Alias,
+		strings.Join(server.Aliases, " "),
+		server.Host,
+		server.User,
+		strings.Join(server.Tags, " "),
+	}, " "))
+
+	for _, term := range terms {
+		if !strings.Contains(haystack, term) {
+			return false
+		}
+	}
+	return true
 }
 
 // serverExists checks if a server with the given alias already exists in the config.
@@ -92,14 +138,17 @@ func (r *Repository) hostContainsPattern(host *ssh_config.Host, target string) b
 }
 
 // createHostFromServer creates a new ssh_config.Host from a domain.Server.
-func (r *Repository) createHostFromServer(server domain.Server) *ssh_config.Host {
+func (r *Repository) createHostFromServer(server domain.Server) (*ssh_config.Host, error) {
+	// ssh_config.Pattern can only be built through NewPattern (upstream ≥1.5
+	// made its fields unexported).
+	pattern, err := ssh_config.NewPattern(server.Alias)
+	if err != nil {
+		return nil, fmt.Errorf("invalid alias %q: %w", server.Alias, err)
+	}
 	host := &ssh_config.Host{
-		Patterns: []*ssh_config.Pattern{
-			{Str: server.Alias},
-		},
-		Nodes:              make([]ssh_config.Node, 0),
-		EOLComment:         "Added by lazyssh",
-		SpaceBeforeComment: strings.Repeat(" ", 4),
+		Patterns:   []*ssh_config.Pattern{pattern},
+		Nodes:      make([]ssh_config.Node, 0),
+		EOLComment: "Added by lazyssh",
 	}
 
 	// Basic config - always present
@@ -185,19 +234,22 @@ func (r *Repository) createHostFromServer(server domain.Server) *ssh_config.Host
 	// Debugging
 	r.addKVNodeIfNotEmpty(host, "LogLevel", server.LogLevel)
 
-	return host
+	return host, nil
 }
 
 // addKVNodeIfNotEmpty adds a key-value node to the host if the value is not empty.
+//
+// Upstream ssh_config (≥1.5) made KV's indentation field unexported, so the
+// four-space indent that the previous fork expressed via LeadingSpace is part of
+// the key itself here.
 func (r *Repository) addKVNodeIfNotEmpty(host *ssh_config.Host, key, value string) {
 	if value == "" {
 		return
 	}
 
 	kvNode := &ssh_config.KV{
-		Key:          key,
-		Value:        value,
-		LeadingSpace: 4,
+		Key:   kvIndent + key,
+		Value: value,
 	}
 	r.insertKVNodeAfterLastKV(host, kvNode)
 }
@@ -244,12 +296,19 @@ func (r *Repository) insertKVNodeAfterLastKV(host *ssh_config.Host, kvNode *ssh_
 	host.Nodes = append(host.Nodes[:insertAt], append([]ssh_config.Node{kvNode}, host.Nodes[insertAt:]...)...)
 }
 
+// matchesKVKey reports whether an ssh_config KV node holds the given directive
+// name. Parsed nodes carry the raw key text (leading indentation included),
+// while lazyssh-created nodes use kvIndent, so both are trimmed before comparing.
+func matchesKVKey(kv *ssh_config.KV, key string) bool {
+	return strings.EqualFold(strings.TrimSpace(kv.Key), key)
+}
+
 // removeNodesByKey removes all nodes with the specified key from the nodes slice
 func removeNodesByKey(nodes []ssh_config.Node, key string) []ssh_config.Node {
 	filtered := make([]ssh_config.Node, 0, len(nodes))
 	for _, node := range nodes {
 		if kv, ok := node.(*ssh_config.KV); ok {
-			if strings.EqualFold(kv.Key, key) {
+			if matchesKVKey(kv, key) {
 				continue // skip nodes with matching key
 			}
 		}
@@ -377,21 +436,26 @@ func (r *Repository) updateHostNodes(host *ssh_config.Host, newServer domain.Ser
 }
 
 // updateOrAddKVNode updates an existing key-value node or adds a new one if it doesn't exist.
+//
+// Parsed nodes keep their original raw value text for faithful round-tripping
+// (ssh_config ≥1.5), so mutating KV.Value in place is not enough to change what
+// gets written back — the node has to be replaced with a freshly built one.
 func (r *Repository) updateOrAddKVNode(host *ssh_config.Host, key, newValue string) {
-	// Try to update existing node
-	for _, node := range host.Nodes {
+	for i, node := range host.Nodes {
 		kvNode, ok := node.(*ssh_config.KV)
-		if ok && strings.EqualFold(kvNode.Key, key) {
-			kvNode.Value = newValue
+		if ok && matchesKVKey(kvNode, key) {
+			host.Nodes[i] = &ssh_config.KV{
+				Key:   kvIndent + r.getProperKeyCase(key),
+				Value: newValue,
+			}
 			return
 		}
 	}
 
 	// Add new node if not found
 	kvNode := &ssh_config.KV{
-		Key:          r.getProperKeyCase(key),
-		Value:        newValue,
-		LeadingSpace: 4,
+		Key:   kvIndent + r.getProperKeyCase(key),
+		Value: newValue,
 	}
 	r.insertKVNodeAfterLastKV(host, kvNode)
 }
@@ -401,7 +465,7 @@ func (r *Repository) removeKVNode(host *ssh_config.Host, key string) {
 	filtered := make([]ssh_config.Node, 0, len(host.Nodes))
 	for _, node := range host.Nodes {
 		if kvNode, ok := node.(*ssh_config.KV); ok {
-			if strings.EqualFold(kvNode.Key, key) {
+			if matchesKVKey(kvNode, key) {
 				continue // Skip this node (remove it)
 			}
 		}

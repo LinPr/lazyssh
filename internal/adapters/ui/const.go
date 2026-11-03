@@ -19,5 +19,5 @@ const (
 	RepoURL = "https://github.com/linpr/lazyssh"
 
 	// DefaultStatusText is the default help text shown in the status bar.
-	DefaultStatusText = " q: quit  /: search  a: add  e: edit  d: delete  p: pin  Enter: ssh "
+	DefaultStatusText = " ?: help  ^K: commands  /: search  s: sort  t: theme  Enter: ssh  →: session  F: forward  V/K/H: tools  q: quit "
 )

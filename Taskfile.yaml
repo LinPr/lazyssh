@@ -14,7 +14,7 @@ tasks:
 
   build:
     cmds:
-      - go build -ldflags "-X github.com/linpr/lazyssh/cmd.version=$(git describe --tags --always --dirty) -X github.com/linpr/lazyssh/cmd.commit=$(git rev-parse --short HEAD)" -o lazyssh ./cmd/
+      - go build -ldflags "-X main.version=$(git describe --tags --always --dirty) -X main.commit=$(git rev-parse --short HEAD)" -o lazyssh ./cmd/
     desc: Build binary
 
   lint:

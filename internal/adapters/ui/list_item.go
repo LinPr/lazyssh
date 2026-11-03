@@ -21,8 +21,8 @@ import (
 
 	"charm.land/bubbles/v2/list"
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/linpr/lazyssh/internal/core/domain"
-	"github.com/mattn/go-runewidth"
 )
 
 // IsForwarding is an optional hook supplied by TUI to indicate active forwarding per alias.
@@ -33,6 +33,7 @@ type ServerItem struct {
 	Server        domain.Server
 	PingStatus    *bool // nil=unknown, true=up, false=down
 	SessionActive bool  // true when a live PTY session exists for this server
+	Forwarding    bool  // true when a port-forward process is running
 }
 
 func (i ServerItem) Title() string {
@@ -67,7 +68,20 @@ func (d ServerDelegate) Update(msg tea.Msg, m *list.Model) tea.Cmd {
 	return nil
 }
 
-// Render draws a single server row in minimal format: pingDot + pin + alias.
+// badgeWidth is the display width reserved after the dot for the pin marker.
+const pinColumnWidth = 2
+
+// Render draws a single server row: status dot + pin + alias + badges.
+//
+// Two details matter here:
+//
+//   - All padding is derived from *visible* widths. Measuring a string that
+//     already contains ANSI escapes counted every escape byte, which reserved 21
+//     columns for a 1-column dot and truncated every alias to "s...".
+//   - The selected row is composed from plain text and highlighted with a single
+//     style. Nesting styled segments inside another style does not work: each
+//     inner Render() ends with a full reset, which clears the selection
+//     background for the rest of the line.
 func (d ServerDelegate) Render(w io.Writer, m list.Model, index int, item list.Item) {
 	serverItem, ok := item.(ServerItem)
 	if !ok {
@@ -82,42 +96,59 @@ func (d ServerDelegate) Render(w io.Writer, m list.Model, index int, item list.I
 		available = 40
 	}
 
-	statusDot := renderPingDot(serverItem.PingStatus)
+	// Trailing badges are optional; drop them first on narrow panes.
+	var badges []string
+	if serverItem.Forwarding {
+		badges = append(badges, "⇅")
+	}
 	if serverItem.SessionActive {
-		statusDot = "🟢"
+		badges = append(badges, "●")
+	}
+	badgeText := ""
+	if len(badges) > 0 {
+		badgeText = " " + strings.Join(badges, " ")
+	}
+	badgeCols := ansi.StringWidth(badgeText)
+	if badgeCols+12 > available {
+		badgeText = ""
+		badgeCols = 0
 	}
 
-	var pinStr string
+	pin := " "
 	if !s.PinnedAt.IsZero() {
-		pinStr = PinnedStyle.Render("★")
-	} else {
-		pinStr = " "
+		pin = "★"
 	}
 
-	// prefixCols = dot_width(1 or 2) + space + pin(1) + space = 3 or 4
-	dotCols := runewidth.StringWidth(statusDot)
-	prefixCols := dotCols + 3
-	aliasWidth := available - prefixCols
-	if aliasWidth < 4 {
-		aliasWidth = 4
+	// dot(1) + space + pin(1) + space = 4 columns before the alias.
+	const prefixCols = 4
+	aliasWidth := available - prefixCols - badgeCols
+	if aliasWidth < 3 {
+		aliasWidth = 3
 	}
-
 	alias := truncatePad(s.Alias, aliasWidth)
 
-	line := statusDot + " " + pinStr + " " + alias
-
 	if isSelected {
-		// Re-measure the line width so the highlight fills exactly `available` cols.
-		lineW := runewidth.StringWidth(line)
-		if pad := available - lineW; pad > 0 {
-			line += strings.Repeat(" ", pad)
+		row := "●" + " " + pin + " " + alias + badgeText
+		if pad := available - ansi.StringWidth(row); pad > 0 {
+			row += strings.Repeat(" ", pad)
 		}
-		line = ListSelectedItemStyle.Render(line)
-	} else {
-		line = ListItemStyle.Render(line)
+		fmt.Fprint(w, ListSelectedItemStyle.Render(row))
+		return
 	}
 
-	fmt.Fprint(w, line)
+	line := renderPingDot(serverItem.PingStatus) + " " + pinStyled(s) + " " + alias + badgeText
+	if pad := available - ansi.StringWidth(line); pad > 0 {
+		line += strings.Repeat(" ", pad)
+	}
+	fmt.Fprint(w, ListItemStyle.Render(line))
+}
+
+// pinStyled renders the pin marker with its own colour.
+func pinStyled(s domain.Server) string {
+	if s.PinnedAt.IsZero() {
+		return " "
+	}
+	return PinnedStyle.Render("★")
 }
 
 // renderPingDot returns a styled dot reflecting ping status.
@@ -132,13 +163,12 @@ func renderPingDot(status *bool) string {
 }
 
 // truncatePad returns s occupying exactly `width` display columns.
-// Strings longer than width are truncated and suffixed with "...".
+// Strings longer than width are truncated and suffixed with "…".
 func truncatePad(s string, width int) string {
-	w := runewidth.StringWidth(s)
+	w := ansi.StringWidth(s)
 	if w > width {
-		t := runewidth.Truncate(s, width, "...")
-		tw := runewidth.StringWidth(t)
-		if tw < width {
+		t := ansi.Truncate(s, width, "…")
+		if tw := ansi.StringWidth(t); tw < width {
 			return t + strings.Repeat(" ", width-tw)
 		}
 		return t
@@ -151,7 +181,7 @@ func truncatePad(s string, width int) string {
 
 // cellPad pads a string so its display width is at least `width` cells.
 func cellPad(s string, width int) string {
-	w := runewidth.StringWidth(s)
+	w := ansi.StringWidth(s)
 	if w >= width {
 		return s
 	}

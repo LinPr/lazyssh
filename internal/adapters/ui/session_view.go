@@ -16,107 +16,69 @@ package ui
 
 import (
 	"fmt"
-	"image/color"
 	"strings"
 
-	"github.com/charmbracelet/x/ansi"
-	"github.com/hinshun/vt10x"
 	"charm.land/lipgloss/v2"
+	uv "github.com/charmbracelet/ultraviolet"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/charmbracelet/x/vt"
 )
 
-// Unexported attribute bitmask values from vt10x/state.go (mirrored here).
-const (
-	vtAttrReverse   int16 = 1 << 0 // 1
-	vtAttrUnderline int16 = 1 << 1 // 2
-	vtAttrBold      int16 = 1 << 2 // 4
-	vtAttrItalic    int16 = 1 << 4 // 16
-)
-
-// renderSessionView renders the full session panel: left list + right terminal.
+// renderSessionView renders the full session view: a tab strip on top, the
+// active terminal below it, and the status bar at the bottom.
 func (m AppModel) renderSessionView() string {
-	bodyH := m.height - 1 // 1 row for status bar
+	bodyH := m.height - 1 - 1 // status bar + tab strip
 	if bodyH < 3 {
 		bodyH = 3
 	}
 
-	left := m.sessions.renderList(bodyH)
-	right := m.sessions.renderTerminal(m.width-sessionListWidth, bodyH)
+	tabs := m.sessions.renderTabStrip(m.width)
+	term := m.sessions.renderTerminal(m.width, bodyH)
+	statusBar := m.sessionStatusBar()
 
-	panels := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
-	statusBar := m.statusBar.View(m.width)
-	return lipgloss.JoinVertical(lipgloss.Left, panels, statusBar)
+	return lipgloss.JoinVertical(lipgloss.Left, tabs, term, statusBar)
 }
 
-// renderList draws the left panel: a bordered list of sessions with status emoji.
-func (m SessionsModel) renderList(h int) string {
+// sessionStatusBar shows the scroll position while browsing history, and the
+// normal status bar otherwise.
+func (m AppModel) sessionStatusBar() string {
+	lines := 0
+	if tab := m.sessions.activeTab(); tab != nil {
+		lines = tab.scrolledLines()
+	}
+	if lines <= 0 {
+		return m.statusBar.View(m.width)
+	}
+	hint := fmt.Sprintf("  ↑ %d lines of history (wheel / PgDn / Esc to return) ", lines)
+	return TabInactiveStyle.Render(hint)
+}
+
+// renderTabStrip draws one line of session tabs, tmux-style.
+func (m SessionsModel) renderTabStrip(width int) string {
 	bStyle := lipgloss.NewStyle().Foreground(colorBorder)
-	inner := sessionListWidth - 2 // width inside │ borders
-
-	writeRow := func(sb *strings.Builder, content string) {
-		vis := ansi.StringWidth(content)
-		if vis > inner {
-			content = ansi.Truncate(content, inner, "")
-			vis = inner
-		}
-		if pad := inner - vis; pad > 0 {
-			content += strings.Repeat(" ", pad)
-		}
-		sb.WriteString(bStyle.Render("│"))
-		sb.WriteString(content)
-		sb.WriteString(bStyle.Render("│"))
-		sb.WriteString("\n")
-	}
-
-	var sb strings.Builder
-
-	// Top border + title
-	sb.WriteString(bStyle.Render("╭" + strings.Repeat("─", inner) + "╮"))
-	sb.WriteString("\n")
-
-	titleText := lipgloss.NewStyle().Bold(true).Foreground(colorAccent).Render("Sessions")
-	titlePad := inner - ansi.StringWidth("Sessions")
-	if titlePad < 0 {
-		titlePad = 0
-	}
-	writeRow(&sb, titleText+strings.Repeat(" ", titlePad))
-
-	// Session rows
-	shown := 1
+	var parts []string
 	for i, t := range m.tabs {
-		if shown >= h-2 { // -2 for top+bottom border
-			break
-		}
-		emoji := "🟢"
+		dot := "●"
 		if t.closed {
-			emoji = "🔴"
+			dot = "○"
 		}
-		style := lipgloss.NewStyle().Foreground(colorText)
+		label := fmt.Sprintf(" %s %d:%s ", dot, i+1, t.server.Alias)
 		if i == m.active {
-			style = lipgloss.NewStyle().
-				Bold(true).
-				Foreground(colorText).
-				Background(colorSelected)
+			parts = append(parts, TabActiveStyle.Render(label))
+		} else {
+			parts = append(parts, TabInactiveStyle.Render(label))
 		}
-		// emoji is 2 wide, space, alias
-		label := emoji + " " + t.server.Alias
-		writeRow(&sb, style.Render(label))
-		shown++
 	}
-
-	// Fill blank rows
-	for shown < h-1 {
-		writeRow(&sb, "")
-		shown++
+	if len(parts) == 0 {
+		parts = append(parts, TabInactiveStyle.Render(" no sessions "))
 	}
-
-	// Hint row at bottom (1 row before border)
-	hint := lipgloss.NewStyle().Foreground(colorDim).Italic(true).Render("^A:menu q:list")
-	writeRow(&sb, hint)
-
-	// Bottom border — no trailing newline so JoinHorizontal aligns correctly
-	sb.WriteString(bStyle.Render("╰" + strings.Repeat("─", inner) + "╯"))
-
-	return sb.String()
+	strip := strings.Join(parts, bStyle.Render("│"))
+	if pad := width - ansi.StringWidth(strip); pad > 0 {
+		strip += strings.Repeat(" ", pad)
+	} else {
+		strip = ansi.Truncate(strip, width, "…")
+	}
+	return strip
 }
 
 // renderTerminal draws the right panel containing the active session's terminal output.
@@ -128,11 +90,7 @@ func (m SessionsModel) renderTerminal(w, h int) string {
 	if tab.closed {
 		return renderClosedTerminal(w, h, tab.server.Alias)
 	}
-
-	tab.term.Lock()
-	defer tab.term.Unlock()
-
-	return renderVT10xGrid(tab.term, w, h)
+	return tab.renderGrid(w, h)
 }
 
 func renderEmptyTerminal(w, h int) string {
@@ -167,110 +125,187 @@ func renderClosedTerminal(w, h int, alias string) string {
 	return strings.Join(lines, "\n")
 }
 
-// renderVT10xGrid converts the vt10x terminal cell grid into a lipgloss-styled
-// string. Consecutive cells sharing the same attributes are batched to minimise
-// style transitions.
-func renderVT10xGrid(term vt10x.View, w, h int) string {
-	cols, rows := term.Size()
-	cur := term.Cursor()
+// renderGrid draws the terminal with the viewport scrolled back by
+// scrollOffset lines, so the wheel can browse history.
+func (t *SessionTab) renderGrid(w, h int) string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	cols, rows := t.term.Width(), t.term.Height()
+	if cols > w {
+		cols = w
+	}
+	if rows > h {
+		rows = h
+	}
+
+	sb := t.term.Scrollback()
+	sbLen := 0
+	if sb != nil {
+		sbLen = sb.Len()
+	}
+
+	offset := t.scrollOffset
+	if offset > sbLen {
+		offset = sbLen
+	}
+
+	// Total addressable lines: history followed by the live screen.
+	total := sbLen + rows
+	// Top line of the viewport, measured from the oldest history line.
+	first := total - rows - offset
+
+	cur := t.term.CursorPosition()
+	showCursor := offset == 0 && !t.term.CursorHidden()
 
 	var out strings.Builder
-	out.Grow(rows * (cols + 20))
+	out.Grow(rows * (cols + 16))
 
-	for row := 0; row < rows && row < h; row++ {
+	for row := 0; row < h; row++ {
 		if row > 0 {
 			out.WriteByte('\n')
 		}
-
-		// Batch cells with identical style attributes.
-		type span struct {
-			text string
-			fg   vt10x.Color
-			bg   vt10x.Color
-			mode int16
+		line := first + row
+		if line < 0 || line >= total {
+			out.WriteString(strings.Repeat(" ", w))
+			continue
 		}
-
-		var spans []span
-		var cur_span span
-
-		for col := 0; col < cols && col < w; col++ {
-			g := term.Cell(col, row)
-			ch := g.Char
-			if ch == 0 {
-				ch = ' '
-			}
-			// Show block cursor on active position
-			if col == cur.X && row == cur.Y {
-				g.Mode |= vtAttrReverse
-			}
-
-			if col == 0 {
-				cur_span = span{string(ch), g.FG, g.BG, g.Mode}
-			} else if g.FG == cur_span.fg && g.BG == cur_span.bg && g.Mode == cur_span.mode {
-				cur_span.text += string(ch)
-			} else {
-				spans = append(spans, cur_span)
-				cur_span = span{string(ch), g.FG, g.BG, g.Mode}
-			}
+		if line < sbLen {
+			out.WriteString(renderCells(sb.Line(line), cols, -1, row, false))
+			continue
 		}
-		if cols > 0 {
-			spans = append(spans, cur_span)
+		y := line - sbLen
+		cursorX := -1
+		if showCursor && y == cur.Y {
+			cursorX = cur.X
 		}
-
-		for _, sp := range spans {
-			style := glyphStyle(sp.fg, sp.bg, sp.mode)
-			out.WriteString(style.Render(sp.text))
-		}
+		out.WriteString(renderScreenRow(t.term, y, cols, cursorX))
 	}
 
-	// Pad missing rows
-	for row := rows; row < h; row++ {
-		out.WriteByte('\n')
-		out.WriteString(strings.Repeat(" ", w))
-	}
-
+	// The loop above already emitted exactly h lines; adding more here would
+	// push the status bar off screen.
 	return out.String()
 }
 
-// glyphStyle builds a lipgloss.Style for the given vt10x fg/bg/mode attributes.
-func glyphStyle(fg, bg vt10x.Color, mode int16) lipgloss.Style {
-	s := lipgloss.NewStyle()
+// renderScreenRow renders one live row, optionally inverting one cell as the cursor.
+func renderScreenRow(term *vt.Emulator, y, cols, cursorX int) string {
+	var sb strings.Builder
+	var run strings.Builder
+	var runStyle *uv.Style
+	runCursor := false
 
-	if fg != vt10x.DefaultFG {
-		s = s.Foreground(vt10xColor(fg))
+	flush := func() {
+		if run.Len() == 0 {
+			return
+		}
+		st := lipgloss.NewStyle()
+		if runStyle != nil {
+			st = cellStyle(*runStyle)
+		}
+		if runCursor {
+			st = st.Reverse(true)
+		}
+		sb.WriteString(st.Render(run.String()))
+		run.Reset()
 	}
-	if bg != vt10x.DefaultBG {
-		s = s.Background(vt10xColor(bg))
+
+	for x := 0; x < cols; x++ {
+		cell := term.CellAt(x, y)
+		if cell == nil {
+			break
+		}
+		if cell.Width == 0 {
+			// Continuation of a wide glyph: its width is already accounted for.
+			continue
+		}
+		cursor := x == cursorX
+		if runStyle == nil || !runStyle.Equal(&cell.Style) || cursor != runCursor {
+			flush()
+			st := cell.Style
+			runStyle = &st
+			runCursor = cursor
+		}
+		if cell.Content == "" {
+			run.WriteByte(' ')
+		} else {
+			run.WriteString(cell.Content)
+		}
 	}
-	if mode&vtAttrReverse != 0 {
-		s = s.Reverse(true)
-	}
-	if mode&vtAttrBold != 0 {
-		s = s.Bold(true)
-	}
-	if mode&vtAttrUnderline != 0 {
-		s = s.Underline(true)
-	}
-	if mode&vtAttrItalic != 0 {
-		s = s.Italic(true)
-	}
-	return s
+	flush()
+	return sb.String()
 }
 
-// vt10xColor converts a vt10x.Color to a color.Color that lipgloss can consume.
-//
-//   - 0–255  : ANSI indexed color → lipgloss.Color("N")
-//   - 256 – (1<<24-1): 24-bit true color r<<16|g<<8|b → lipgloss.Color("#rrggbb")
-//   - ≥ 1<<24: DefaultFG/DefaultBG — caller must guard against these.
-func vt10xColor(c vt10x.Color) color.Color {
-	if c < 256 {
-		return lipgloss.Color(fmt.Sprintf("%d", c))
+// renderCells renders a stored scrollback line.
+func renderCells(line uv.Line, cols, cursorX, row int, showCursor bool) string {
+	var sb strings.Builder
+	var run strings.Builder
+	var runStyle *uv.Style
+
+	flush := func() {
+		if run.Len() == 0 {
+			return
+		}
+		st := lipgloss.NewStyle()
+		if runStyle != nil {
+			st = cellStyle(*runStyle)
+		}
+		sb.WriteString(st.Render(run.String()))
+		run.Reset()
 	}
-	// 24-bit true color encoded as r<<16|g<<8|b
-	r := (c >> 16) & 0xFF
-	g := (c >> 8) & 0xFF
-	b := c & 0xFF
-	return lipgloss.Color(fmt.Sprintf("#%02x%02x%02x", r, g, b))
+
+	for x := 0; x < cols; x++ {
+		var cell uv.Cell
+		if x < len(line) {
+			cell = line[x]
+		}
+		if cell.Width == 0 && x < len(line) {
+			continue
+		}
+		if runStyle == nil || !runStyle.Equal(&cell.Style) {
+			flush()
+			st := cell.Style
+			runStyle = &st
+		}
+		if cell.Content == "" {
+			run.WriteByte(' ')
+		} else {
+			run.WriteString(cell.Content)
+		}
+	}
+	flush()
+
+	// Pad to the pane width so borders stay aligned.
+	if pad := cols - ansi.StringWidth(sb.String()); pad > 0 {
+		sb.WriteString(strings.Repeat(" ", pad))
+	}
+	return sb.String()
+}
+
+// cellStyle converts a terminal cell style into a lipgloss style.
+func cellStyle(s uv.Style) lipgloss.Style {
+	st := lipgloss.NewStyle()
+	if s.Fg != nil {
+		st = st.Foreground(s.Fg)
+	}
+	if s.Bg != nil {
+		st = st.Background(s.Bg)
+	}
+	if s.Attrs&uv.AttrBold != 0 {
+		st = st.Bold(true)
+	}
+	if s.Attrs&uv.AttrItalic != 0 {
+		st = st.Italic(true)
+	}
+	if s.Attrs&uv.AttrReverse != 0 {
+		st = st.Reverse(true)
+	}
+	if s.Attrs&uv.AttrStrikethrough != 0 {
+		st = st.Strikethrough(true)
+	}
+	if s.Underline != 0 {
+		st = st.Underline(true)
+	}
+	return st
 }
 
 // renderTerminalOverlay renders a clean bordered terminal panel.
@@ -296,9 +331,7 @@ func renderTerminalOverlay(tab *SessionTab, w, h int, focused bool) string {
 	}
 	termW := inner
 
-	tab.term.Lock()
-	termContent := renderVT10xGrid(tab.term, termW, termH)
-	tab.term.Unlock()
+	termContent := tab.renderGrid(termW, termH)
 
 	var sb strings.Builder
 

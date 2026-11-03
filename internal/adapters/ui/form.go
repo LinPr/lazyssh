@@ -29,7 +29,7 @@ import (
 type FormMode int
 
 const (
-	FormAdd  FormMode = iota
+	FormAdd FormMode = iota
 	FormEdit
 )
 
@@ -495,38 +495,44 @@ func (m FormModel) ToServer() domain.Server {
 		port = p
 	}
 
-	server := domain.Server{
-		Alias:                    get("Alias"),
-		Host:                     get("Host"),
-		User:                     get("User"),
-		Port:                     port,
-		IdentityFiles:            splitComma(get("Keys")),
-		Tags:                     splitComma(get("Tags")),
-		ProxyJump:                get("ProxyJump"),
-		ProxyCommand:             get("ProxyCommand"),
-		ConnectTimeout:           get("ConnectTimeout"),
-		ConnectionAttempts:       get("ConnectionAttempts"),
-		ServerAliveInterval:      get("ServerAliveInterval"),
-		ServerAliveCountMax:      get("ServerAliveCountMax"),
-		Compression:              get("Compression"),
-		ControlMaster:            get("ControlMaster"),
-		ControlPath:              get("ControlPath"),
-		ControlPersist:           get("ControlPersist"),
-		LocalForward:             splitComma(get("LocalForward")),
-		RemoteForward:            splitComma(get("RemoteForward")),
-		DynamicForward:           splitComma(get("DynamicForward")),
-		PubkeyAuthentication:     get("PubkeyAuthentication"),
-		IdentitiesOnly:           get("IdentitiesOnly"),
-		PasswordAuthentication:   get("PasswordAuthentication"),
-		PreferredAuthentications: get("PreferredAuthentications"),
-		AddKeysToAgent:           get("AddKeysToAgent"),
-		StrictHostKeyChecking:    get("StrictHostKeyChecking"),
-		Ciphers:                  get("Ciphers"),
-		MACs:                     get("MACs"),
-		KexAlgorithms:            get("KexAlgorithms"),
-		HostKeyAlgorithms:        get("HostKeyAlgorithms"),
-		LogLevel:                 get("LogLevel"),
+	// Start from the server that is currently on disk so that every directive the
+	// form does not expose (RemoteCommand, SendEnv, SetEnv, IPQoS, …) survives an
+	// edit untouched. Only form-owned fields are overwritten below.
+	var server domain.Server
+	if m.mode == FormEdit && m.original != nil {
+		server = *m.original
 	}
+
+	server.Alias = get("Alias")
+	server.Host = get("Host")
+	server.User = get("User")
+	server.Port = port
+	server.IdentityFiles = splitComma(get("Keys"))
+	server.Tags = splitComma(get("Tags"))
+	server.ProxyJump = get("ProxyJump")
+	server.ProxyCommand = get("ProxyCommand")
+	server.ConnectTimeout = get("ConnectTimeout")
+	server.ConnectionAttempts = get("ConnectionAttempts")
+	server.ServerAliveInterval = get("ServerAliveInterval")
+	server.ServerAliveCountMax = get("ServerAliveCountMax")
+	server.Compression = get("Compression")
+	server.ControlMaster = get("ControlMaster")
+	server.ControlPath = get("ControlPath")
+	server.ControlPersist = get("ControlPersist")
+	server.LocalForward = splitComma(get("LocalForward"))
+	server.RemoteForward = splitComma(get("RemoteForward"))
+	server.DynamicForward = splitComma(get("DynamicForward"))
+	server.PubkeyAuthentication = get("PubkeyAuthentication")
+	server.IdentitiesOnly = get("IdentitiesOnly")
+	server.PasswordAuthentication = get("PasswordAuthentication")
+	server.PreferredAuthentications = get("PreferredAuthentications")
+	server.AddKeysToAgent = get("AddKeysToAgent")
+	server.StrictHostKeyChecking = get("StrictHostKeyChecking")
+	server.Ciphers = get("Ciphers")
+	server.MACs = get("MACs")
+	server.KexAlgorithms = get("KexAlgorithms")
+	server.HostKeyAlgorithms = get("HostKeyAlgorithms")
+	server.LogLevel = get("LogLevel")
 
 	// Preserve metadata fields when editing
 	if m.mode == FormEdit && m.original != nil {
@@ -618,4 +624,3 @@ func buildSSHConfigPreview(server domain.Server) string {
 
 	return sb.String()
 }
-
