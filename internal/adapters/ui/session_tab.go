@@ -16,6 +16,7 @@ package ui
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"sync"
@@ -239,7 +240,15 @@ func (t *SessionTab) close() {
 		_ = t.cmd.Process.Kill()
 	}
 	_ = t.ptm.Close()
-	_ = t.term.Close()
+
+	// Unblock responseLoop by closing the emulator's input pipe rather than
+	// calling term.Close(). Emulator.Close() writes an unsynchronised `closed`
+	// flag that Emulator.Read() reads from another goroutine, which the race
+	// detector flags (x/vt v0.1.0). Closing the pipe is documented-safe for
+	// concurrent use and makes the blocked Read return io.EOF.
+	if c, ok := t.term.InputPipe().(io.Closer); ok {
+		_ = c.Close()
+	}
 }
 
 // waitForPtyOutput returns a Cmd that blocks until the session produces new

@@ -1,0 +1,106 @@
+name: CI
+
+# Runs on every push to main and on pull requests. The release workflow only
+# fires on tags, so this is what gives feedback while actually developing.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CGO_ENABLED: "0"
+  GOFLAGS: "-trimpath"
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted="$(gofmt -l cmd internal)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      # The tests drive pty/tmux-style code paths; -race is the point of this
+      # job, since the session reader and the render loop share an emulator.
+      - name: Test (race detector)
+        run: go test -race ./...
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+            ext: ""
+          - goos: windows
+            goarch: amd64
+            ext: ".exe"
+          # Not published, but keeps the code honest on other architectures.
+          - goos: linux
+            goarch: arm64
+            ext: ""
+          - goos: darwin
+            goarch: arm64
+            ext: ""
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          EXT: ${{ matrix.ext }}
+        run: |
+          set -euo pipefail
+          out="lazyssh-${GOOS}-${GOARCH}${EXT}"
+          go build \
+            -ldflags "-s -w -X main.version=ci-${GITHUB_SHA::7}" \
+            -o "${out}" ./cmd/
+          echo "built ${out}: $(stat -c%s "${out}") bytes"
+          file "${out}"
+
+      - name: Smoke test
+        if: matrix.goos == 'linux' && matrix.goarch == 'amd64'
+        run: |
+          chmod +x lazyssh-linux-amd64
+          ./lazyssh-linux-amd64 --version
+          ./lazyssh-linux-amd64 --help > /dev/null
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: lazyssh-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: lazyssh-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.ext }}
+          if-no-files-found: error
+          compression-level: 0
